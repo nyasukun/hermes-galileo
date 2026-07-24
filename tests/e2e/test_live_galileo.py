@@ -397,7 +397,7 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
         assert len(llm_spans) == 2
         for span in llm_spans:
             assert span.model == "synthetic-live-e2e-model"
-            assert span.finish_reason == "stop"
+            assert _normalized(span.finish_reason) == "stop"
             metrics = span.metrics.to_dict()
             assert metrics["num_input_tokens"] == 5
             assert metrics["num_output_tokens"] == 5
