@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-galileo"
+version = "0.1.0"
+description = "Galileo observability plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = "Apache-2.0"
+authors = [{ name = "hermes-galileo contributors" }]
+keywords = ["galileo", "hermes-agent", "llm", "observability", "opentelemetry"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Monitoring",
+  "Typing :: Typed",
+]
+dependencies = [
+  "galileo[otel]>=2.5.1,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-cov>=6,<8",
+  "pytest-timeout>=2.4,<3",
+  "ruff>=0.12,<1",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes_galileo = "hermes_galileo"
+
+[project.urls]
+Repository = "https://github.com/nyasukun/hermes-galileo"
+Issues = "https://github.com/nyasukun/hermes-galileo/issues"
+
+[tool.setuptools]
+packages = ["hermes_galileo"]
+
+[tool.setuptools.package-data]
+hermes_galileo = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "integration: multi-component tests with no external service",
+  "e2e: complete Hermes-hook to Galileo-SDK export tests",
+  "live: requires a real Galileo account",
+]
+timeout = 30
+
+[tool.coverage.run]
+branch = true
+source = ["hermes_galileo"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
