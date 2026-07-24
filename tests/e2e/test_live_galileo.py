@@ -338,7 +338,7 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
                 return None
             assert len(traces) == 2, "the run produced more than two Galileo traces"
             trace_ids = {trace.trace_id for trace in traces}
-            spans = _records(
+            span_records = _records(
                 get_spans(
                     project.id,
                     log_stream_id=log_stream.id,
@@ -352,12 +352,16 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
                     limit=100,
                 )
             )
-            if len(spans) < 4:
+            root_spans = [span for span in span_records if span.type_ == "agent"]
+            child_spans = [span for span in span_records if span.type_ in {"llm", "tool"}]
+            if len(root_spans) < 2 or len(child_spans) < 4:
                 return None
-            assert len(spans) == 4, "the run produced unexpected child spans"
-            return session, traces, spans
+            assert len(span_records) == 6, "the run produced unexpected Galileo spans"
+            assert len(root_spans) == 2, "the run produced unexpected Agent root spans"
+            assert len(child_spans) == 4, "the run produced unexpected child spans"
+            return session, traces, span_records
 
-        session, traces, spans = _poll(read_records, timeout=180)
+        session, traces, span_records = _poll(read_records, timeout=180)
         assert session.external_id == expected_external_id
         assert raw_session_id not in _record_text(session)
         assert len({trace.trace_id for trace in traces}) == 2
@@ -370,22 +374,26 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
             ]
             assert len(matching) == 1
         all_record_text = "\n".join(
-            [_record_text(session), *trace_texts, *map(_record_text, spans)]
+            [_record_text(session), *trace_texts, *map(_record_text, span_records)]
         )
         assert raw_session_id not in all_record_text
         assert raw_sender_id not in all_record_text
         assert privacy_canary not in all_record_text
 
         trace_record_ids = {trace.trace_id: trace.id for trace in traces}
-        assert all(span.session_id == session.id for span in spans)
-        assert all(span.trace_id in trace_record_ids for span in spans)
-        assert all(span.parent_id == trace_record_ids[span.trace_id] for span in spans)
+        root_spans = [span for span in span_records if span.type_ == "agent"]
+        child_spans = [span for span in span_records if span.type_ in {"llm", "tool"}]
+        root_span_ids = {span.trace_id: span.id for span in root_spans}
+        assert all(span.session_id == session.id for span in span_records)
+        assert all(span.trace_id in trace_record_ids for span in span_records)
+        assert set(root_span_ids) == set(trace_record_ids)
+        assert all(span.parent_id == root_span_ids[span.trace_id] for span in child_spans)
 
         for trace_id in trace_record_ids:
-            trace_spans = [span for span in spans if span.trace_id == trace_id]
+            trace_spans = [span for span in child_spans if span.trace_id == trace_id]
             assert {span.type_ for span in trace_spans} == {"llm", "tool"}
 
-        llm_spans = [span for span in spans if span.type_ == "llm"]
+        llm_spans = [span for span in child_spans if span.type_ == "llm"]
         assert len(llm_spans) == 2
         for span in llm_spans:
             assert span.model == "synthetic-live-e2e-model"
@@ -395,14 +403,13 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
             assert metrics["num_output_tokens"] == 5
             assert metrics["num_total_tokens"] == 10
 
-        tool_spans = [span for span in spans if span.type_ == "tool"]
+        tool_spans = [span for span in child_spans if span.type_ == "tool"]
         assert len(tool_spans) == 2
         assert len([span for span in tool_spans if "synthetic_ok" in str(span.name)]) == 1
         failed_tools = [span for span in tool_spans if "synthetic_failure" in str(span.name)]
         assert len(failed_tools) == 1
-        failed_status = failed_tools[0].status_code
-        assert not isinstance(failed_status, Unset)
-        assert failed_status not in (None, 0)
+        # Galileo Search's numeric status_code is not the OTLP Span Status.
+        # The wire-level E2E pins ERROR status and error.type before ingestion.
 
         require_quality = (
             os.environ.get(

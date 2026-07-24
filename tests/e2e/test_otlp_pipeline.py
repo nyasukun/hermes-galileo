@@ -20,6 +20,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
     ExportTraceServiceResponse,
 )
+from opentelemetry.proto.trace.v1.trace_pb2 import Status
 
 import hermes_galileo
 from hermes_galileo import hooks
@@ -409,6 +410,24 @@ def test_complete_plugin_pipeline_exports_valid_otlp(
             status="ok",
         )
         context.emit(
+            "pre_tool_call",
+            **base,
+            tool_call_id="tool-e2e-failure",
+            api_request_id="api-e2e",
+            tool_name="deployment_restart",
+            args={"authorization": "Bearer failed-tool-secret-token"},
+        )
+        context.emit(
+            "post_tool_call",
+            **base,
+            tool_call_id="tool-e2e-failure",
+            api_request_id="api-e2e",
+            tool_name="deployment_restart",
+            status="error",
+            error_type="synthetic_tool_error",
+            error_message="redact this Bearer failed-tool-error-secret",
+        )
+        context.emit(
             "post_llm_call",
             **base,
             assistant_response="Deployment is healthy",
@@ -436,24 +455,31 @@ def test_complete_plugin_pipeline_exports_valid_otlp(
             "invoke_agent Hermes Agent",
             "chat gpt-e2e",
             "execute_tool deployment_status",
+            "execute_tool deployment_restart",
         }
 
         root = spans["invoke_agent Hermes Agent"]
         llm = spans["chat gpt-e2e"]
         tool = spans["execute_tool deployment_status"]
+        failed_tool = spans["execute_tool deployment_restart"]
         assert root["parent_span_id"] == b""
         assert llm["parent_span_id"] == root["span_id"]
         assert tool["parent_span_id"] == root["span_id"]
+        assert failed_tool["parent_span_id"] == root["span_id"]
         assert {span["trace_id"] for span in spans.values()} == {root["trace_id"]}
         assert llm["attributes"]["gen_ai.usage.input_tokens"] == 13
         assert llm["attributes"]["gen_ai.usage.output_tokens"] == 4
         assert json.loads(llm["attributes"]["gen_ai.output.messages"]) == [
             {"content": "Deployment is healthy", "role": "assistant"}
         ]
+        assert failed_tool["status"] == Status.STATUS_CODE_ERROR
+        assert failed_tool["attributes"]["error.type"] == "synthetic_tool_error"
 
         wire_body = call["body"]
         assert b"provider-secret-token" not in wire_body
         assert b"tool-secret-token" not in wire_body
+        assert b"failed-tool-secret-token" not in wire_body
+        assert b"failed-tool-error-secret" not in wire_body
         assert b"browser-cookie-secret" not in wire_body
         assert b"csrf-secret" not in wire_body
         assert b"wire-private-key-material" not in wire_body
