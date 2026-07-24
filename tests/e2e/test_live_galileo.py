@@ -107,29 +107,133 @@ def _completed_metric_value(value: Any) -> Any | None:
     return None
 
 
-def _conversation_quality_value(value: Any) -> Any | None:
+def _metric_identifier_matches(
+    value: Any,
+    *,
+    metric_keys: set[str] | None = None,
+) -> bool:
+    normalized = _normalized(value)
+    if "conversationquality" in normalized:
+        return True
+    return bool(
+        normalized
+        and metric_keys
+        and normalized in {_normalized(metric_key) for metric_key in metric_keys}
+    )
+
+
+def _conversation_quality_value(
+    value: Any,
+    *,
+    metric_keys: set[str] | None = None,
+) -> Any | None:
     if isinstance(value, dict):
         normalized_items = {_normalized(key): item for key, item in value.items()}
         for key, item in normalized_items.items():
-            if "conversationquality" in key:
+            if _metric_identifier_matches(key, metric_keys=metric_keys):
                 found = _completed_metric_value(item)
                 if found is not None:
                     return found
-        metric_name = normalized_items.get("name") or normalized_items.get("metricname")
-        if "conversationquality" in _normalized(metric_name):
+        metric_name = (
+            normalized_items.get("name")
+            or normalized_items.get("metricname")
+            or normalized_items.get("metrickeyalias")
+        )
+        if _metric_identifier_matches(metric_name, metric_keys=metric_keys):
             found = _completed_metric_value(value)
             if found is not None:
                 return found
         for item in value.values():
-            found = _conversation_quality_value(item)
+            found = _conversation_quality_value(item, metric_keys=metric_keys)
             if found is not None:
                 return found
     elif isinstance(value, list):
         for item in value:
-            found = _conversation_quality_value(item)
+            found = _conversation_quality_value(item, metric_keys=metric_keys)
             if found is not None:
                 return found
     return None
+
+
+def _conversation_quality_metric_keys(
+    *,
+    project_name: str,
+    log_stream_name: str,
+) -> set[str] | None:
+    metric_stream = MetricLogStream.get(
+        name=log_stream_name,
+        project_name=project_name,
+    )
+    if metric_stream is None:
+        return None
+    keys: set[str] = set()
+    for column in metric_stream.session_columns.values():
+        identifiers = (
+            getattr(column, "label", None),
+            getattr(column, "metric_key_alias", None),
+        )
+        if not any(
+            _metric_identifier_matches(identifier)
+            for identifier in identifiers
+            if identifier is not None
+        ):
+            continue
+        column_id = str(getattr(column, "id", "") or "")
+        if not column_id:
+            continue
+        keys.add(column_id)
+        if column_id.startswith("metrics/"):
+            keys.add(column_id.removeprefix("metrics/"))
+    return keys or None
+
+
+def _conversation_quality_diagnostic(
+    value: Any,
+    *,
+    metric_keys: set[str],
+) -> dict[str, Any]:
+    payload = value.to_dict() if hasattr(value, "to_dict") else value
+    if not isinstance(payload, dict):
+        return {"record_type": type(payload).__name__}
+
+    metric_info = payload.get("metric_info")
+    if hasattr(metric_info, "to_dict"):
+        metric_info = metric_info.to_dict()
+    metric_info = metric_info if isinstance(metric_info, dict) else {}
+    target_states: list[dict[str, Any]] = []
+    for key, item in metric_info.items():
+        item = item.to_dict() if hasattr(item, "to_dict") else item
+        if not isinstance(item, dict):
+            continue
+        normalized_items = {_normalized(name): entry for name, entry in item.items()}
+        aliases = (
+            key,
+            normalized_items.get("name"),
+            normalized_items.get("metricname"),
+            normalized_items.get("metrickeyalias"),
+        )
+        if not any(
+            _metric_identifier_matches(alias, metric_keys=metric_keys)
+            for alias in aliases
+            if alias is not None
+        ):
+            continue
+        state: dict[str, Any] = {
+            "status_type": _normalized(normalized_items.get("statustype", "")) or "missing",
+        }
+        error_code = normalized_items.get("emserrorcode")
+        if error_code is not None:
+            state["ems_error_code"] = error_code
+        target_states.append(state)
+
+    return {
+        "metrics_batch_id_present": bool(payload.get("metrics_batch_id")),
+        "session_batch_id_present": bool(payload.get("session_batch_id")),
+        "metric_info_entry_count": len(metric_info),
+        "target_states": target_states,
+        "progress_message_present": bool(payload.get("progress_message")),
+        "error_message_present": bool(payload.get("error_message")),
+    }
 
 
 def _ensure_galileo_resources(
@@ -215,6 +319,7 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
         ).lower()
         == "true"
     )
+    quality_metric_keys: set[str] = set()
 
     monkeypatch.syspath_prepend(str(hermes_source.resolve()))
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -239,14 +344,26 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
     expected_external_id = f"hermes:{pseudonym}"
     expected_pairs = [
         (
-            f"{run_marker}:turn-1:input",
-            f"{run_marker}:turn-1:input Authorization: Bearer {privacy_canary}",
-            f"{run_marker}:turn-1:output",
+            f"{run_marker}:turn-1 How do I reset my account password?",
+            (
+                f"{run_marker}:turn-1 How do I reset my account password? "
+                f"Authorization: Bearer {privacy_canary}"
+            ),
+            (
+                f"{run_marker}:turn-1 Use the password reset link on the sign-in page. "
+                "It will send a verification email to your registered address."
+            ),
         ),
         (
-            f"{run_marker}:turn-2:input",
-            f"{run_marker}:turn-2:input Authorization: Bearer {privacy_canary}",
-            f"{run_marker}:turn-2:output",
+            f"{run_marker}:turn-2 Will resetting it sign me out of other devices?",
+            (
+                f"{run_marker}:turn-2 Will resetting it sign me out of other devices? "
+                f"Authorization: Bearer {privacy_canary}"
+            ),
+            (
+                f"{run_marker}:turn-2 Yes. After the reset, sign in again on each "
+                "device with your new password."
+            ),
         ),
     ]
 
@@ -311,6 +428,14 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
             )
             _poll(
                 lambda: _conversation_quality_is_enabled(
+                    project_name=project_name,
+                    log_stream_name=log_stream_name,
+                ),
+                timeout=60,
+                interval=2,
+            )
+            quality_metric_keys = _poll(
+                lambda: _conversation_quality_metric_keys(
                     project_name=project_name,
                     log_stream_name=log_stream_name,
                 ),
@@ -453,6 +578,8 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
             if len(traces) < 2:
                 return None
             assert len(traces) == 2, "the run produced more than two Galileo traces"
+            if not all(getattr(trace, "is_complete", False) is True for trace in traces):
+                return None
             trace_ids = {trace.trace_id for trace in traces}
             span_records = _records(
                 get_spans(
@@ -482,6 +609,7 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
         assert raw_session_id not in _record_text(session)
         assert len({trace.trace_id for trace in traces}) == 2
         assert len({trace.id for trace in traces}) == 2
+        assert all(getattr(trace, "is_complete", False) is True for trace in traces)
 
         trace_texts = [_record_text(trace) for trace in traces]
         for expected_input, _, expected_output in expected_pairs:
@@ -528,6 +656,7 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
         # The wire-level E2E pins ERROR status and error.type before ingestion.
 
         if require_quality:
+            last_quality_diagnostic: dict[str, Any] = {}
 
             def read_conversation_quality() -> Any | None:
                 project = get_project(name=project_name)
@@ -558,9 +687,39 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
                 assert len(refreshed_sessions) == 1
                 refreshed_session = refreshed_sessions[0]
                 assert refreshed_session.id == session.id
-                return _conversation_quality_value(refreshed_session.to_dict())
+                last_quality_diagnostic.clear()
+                last_quality_diagnostic.update(
+                    _conversation_quality_diagnostic(
+                        refreshed_session,
+                        metric_keys=quality_metric_keys,
+                    )
+                )
+                terminal_states = [
+                    state
+                    for state in last_quality_diagnostic.get("target_states", [])
+                    if state.get("status_type") in {"error", "failed", "notapplicable"}
+                ]
+                if terminal_states:
+                    raise AssertionError("Conversation Quality reached a terminal failure state")
+                return _conversation_quality_value(
+                    refreshed_session.to_dict(),
+                    metric_keys=quality_metric_keys,
+                )
 
-            assert _poll(read_conversation_quality, timeout=300) is not None
+            try:
+                assert _poll(read_conversation_quality, timeout=300) is not None
+            except AssertionError as exc:
+                diagnostic = json.dumps(
+                    last_quality_diagnostic,
+                    sort_keys=True,
+                    default=str,
+                )
+                raise AssertionError(
+                    "Conversation Quality did not complete. "
+                    "Ensure Galileo has an active LLM integration for metric judging "
+                    "and 100% metric sampling on the dedicated CI log stream. "
+                    f"Safe metric state: {diagnostic}"
+                ) from exc
     finally:
         manager.invoke_hook("on_session_finalize", session_id=raw_session_id)
         hermes_galileo._shutdown_runtime()

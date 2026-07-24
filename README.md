@@ -222,6 +222,8 @@ test suite は次を含みます。
 
 wire-level E2E は外部 credential を使いません。
 実 Galileo 画面/API からnative Session、複数turn、ingestion、privacy canary、Conversation Qualityをread-backするlive E2Eは、専用project、log stream、API keyが必要な運用受入項目です。
+Conversation QualityはLLM-as-a-judge metricであるため、`GALILEO_API_KEY`だけでは計算できません。
+Galileo ConsoleのIntegrationsでjudge用LLM integrationを有効にし、専用log streamのmetric samplingを100%にしてください。
 専用projectは事前に作成し、live E2Eは公式SDKで専用log streamを作成または再利用してConversation Qualityを送信前に有効化します。
 既存のConversation Quality設定は変更せず、metric未設定のstreamだけを構成します。
 別metricだけが設定されたstreamは上書きせず失敗するため、productionや共有log streamを指定しないでください。

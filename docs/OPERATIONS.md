@@ -496,12 +496,14 @@ startup bufferはboundedであり、queue full時にAgentをblockしない。
 ### Conversation Qualityが計算されない
 
 1. 対象log streamでConversation Qualityが有効かを確認する。
-2. 対象native Sessionに二つ以上のturn traceが入り、各root traceに実textのinputとoutputがあることを確認する。
-3. `HERMES_GALILEO_CAPTURE_CONTENT=true`と`HERMES_GALILEO_SAMPLE_RATE=1.0`を会話評価profileへ設定したことを確認する。
-4. content取得の承認記録とprivacy canary結果を確認する。
-5. metric sampling、judge model、計算queue、cost上限をGalileo側で確認する。
-6. placeholderだけの通常profileはConversation Qualityの有用性を保証しないため、評価対象から除外する。
-7. adapterのSession attachment不良とGalileo側のmetric計算失敗を別々に切り分ける。
+2. Galileo ConsoleのIntegrationsでjudge用LLM integrationが有効かを確認する。Galileo認証用の`GALILEO_API_KEY`だけではLLM-as-a-judgeを計算できない。
+3. 専用log streamのmetric samplingを100%にする。これはHermes側のtrace samplingとは別設定である。
+4. 対象native Sessionに二つ以上のturn traceが入り、各root traceに実textのinputとoutputがあることを確認する。
+5. `HERMES_GALILEO_CAPTURE_CONTENT=true`と`HERMES_GALILEO_SAMPLE_RATE=1.0`を会話評価profileへ設定したことを確認する。
+6. content取得の承認記録とprivacy canary結果を確認する。
+7. judge model、計算queue、cost上限をGalileo側で確認する。
+8. placeholderだけの通常profileはConversation Qualityの有用性を保証しないため、評価対象から除外する。
+9. adapterのSession attachment不良とGalileo側のmetric計算失敗を別々に切り分ける。
 
 ### State evictionまたはorphan増加
 
@@ -685,6 +687,8 @@ live E2Eには次のrepository secretとvariablesを使う。
 | variable | `GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY` | `true` | Conversation Qualityをlive受入の必須assertionにする |
 
 専用projectは事前に作成し、live E2Eは公式SDKで専用log streamを作成または再利用してConversation Qualityを送信前に有効化する。
+Galileo Consoleではjudge用LLM integrationを事前に有効化し、専用log streamのmetric samplingを100%にする。
+このjudge integrationはrepository secretの`GALILEO_API_KEY`とは別のGalileo側運用資源である。
 既存のConversation Quality設定は変更せず、metric未設定のstreamだけを構成する。
 別metricだけが設定されたstreamは上書きせずfail-closedにするため、productionや共有log streamを指定してはならない。
 通常は`GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY`を既定値`true`のまま使う。

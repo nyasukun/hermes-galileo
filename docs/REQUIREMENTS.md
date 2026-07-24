@@ -276,7 +276,7 @@ TST-009は日次Workflowで最新Galileoを検証するが、support下限versio
 | CI-005 | 必須 | pull requestへsecretを安全に渡す | 同一repositoryの信頼済みpull requestだけをlive E2E対象とし、fork pull requestではskipし、`pull_request_target`を使わず、job permissionsを最小化する | 充足 |
 | CI-006 | 必須 | Workflow自体の供給網と実行量を制御する | third-party actionをcommit SHAでpinし、timeoutと最小権限を設定し、pull request runは同じrefの古いrunをcancelし、dependency watchはbaseline更新競合を避けるため直列実行する | 充足 |
 
-CI-004のGalileo project、log stream、API key、metric実行基盤、read APIはrepository外の運用資源である。
+CI-004のGalileo project、log stream、API key、judge用LLM integration、100%のmetric sampling、metric実行基盤、read APIはrepository外の運用資源である。
 そのため、Workflow実装の充足状態とlive Galileo受入の外部依存を分けて評価する。
 CI-001のWorkflowは実装済みだが、required checkとmerge protectionの有効化はGitHub repository設定に依存する。
 実Hermes互換checkの範囲はsource上のPluginManager、entry point、registration、全observer hookの呼び出しまでであり、Hermes本体のpackage install、実LLMを使うAgent loop、gateway起動は含まない。

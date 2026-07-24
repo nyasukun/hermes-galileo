@@ -533,7 +533,7 @@ GalileoのConversation QualityはSession単位でtraceのinputとoutputを評価
 会話評価profileだけが明示的にcontent取得を有効化し、data ownerとsecurity reviewerが承認したfixtureまたは本番dataへ限定する。
 content取得を有効にしても、secret redaction、hidden reasoning除去、collection上限、文字数上限を解除しない。
 
-Conversation Qualityの算出、metric設定、judge model、結果のread-backはGalileo側の外部依存である。
+Conversation Qualityの算出、metric設定、judge用LLM integration、metric sampling、結果のread-backはGalileo側の外部依存である。
 adapterが保証するのは、評価対象となるnative Session、複数trace、trace inputとoutputの構造までである。
 live E2Eは、対象SessionにConversation Qualityが計算されたことをGalileo APIまたは画面で確認する。
 専用log streamの作成とConversation Quality設定はlive E2Eのcontrol planeだけが行い、adapter runtimeには含めない。
