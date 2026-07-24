@@ -536,6 +536,8 @@ content取得を有効にしても、secret redaction、hidden reasoning除去�
 Conversation Qualityの算出、metric設定、judge model、結果のread-backはGalileo側の外部依存である。
 adapterが保証するのは、評価対象となるnative Session、複数trace、trace inputとoutputの構造までである。
 live E2Eは、対象SessionにConversation Qualityが計算されたことをGalileo APIまたは画面で確認する。
+専用log streamの作成とConversation Quality設定はlive E2Eのcontrol planeだけが行い、adapter runtimeには含めない。
+live E2Eは既存Conversation Quality設定を保持し、metric未設定の専用streamだけを構成し、他metricだけが設定されたstreamは上書きせずfail-closedにする。
 
 ## GitHub Actionsによる互換性検証
 

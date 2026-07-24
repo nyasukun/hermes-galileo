@@ -221,7 +221,10 @@ test suite は次を含みます。
 - official Session APIの作成または再利用、HMAC external ID、`galileo.session.id`、複数turn、timeout時fail-openのcontract test
 
 wire-level E2E は外部 credential を使いません。
-実 Galileo 画面/API からnative Session、複数turn、ingestion、privacy canary、Conversation Qualityをread-backするlive E2Eは、専用project、log stream、API key、metric設定が必要な運用受入項目です。
+実 Galileo 画面/API からnative Session、複数turn、ingestion、privacy canary、Conversation Qualityをread-backするlive E2Eは、専用project、log stream、API keyが必要な運用受入項目です。
+専用projectは事前に作成し、live E2Eは公式SDKで専用log streamを作成または再利用してConversation Qualityを送信前に有効化します。
+既存のConversation Quality設定は変更せず、metric未設定のstreamだけを構成します。
+別metricだけが設定されたstreamは上書きせず失敗するため、productionや共有log streamを指定しないでください。
 
 GitHub Actionsは、pull requestごとにPython 3.10、3.12、3.14でlocal contractを検証します。
 別のsecret不要jobでbaselineの実Hermes sourceを取得し、PluginManager registrationと全observer hookの互換性も検証します。

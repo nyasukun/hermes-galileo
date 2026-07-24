@@ -272,18 +272,18 @@ TST-009は日次Workflowで最新Galileoを検証するが、support下限versio
 | CI-001 | 必須 | pull requestでlocal contractを検証する | support対象Python matrixでlint、format check、unit、integration、stub wire E2Eを実行し、baselineの実Hermes sourceでPluginManager registrationと全observer hookを検証し、required checkが失敗したpull requestをmergeしない | 一部充足 |
 | CI-002 | 必須 | HermesとGalileoの更新を日次確認する | `schedule`と手動実行でHermes mainのcommit SHA、PyPI project metadataが示すGalileo current release、およびpipが解決したGalileoの全依存closureをbaselineと比較し、更新時だけ検出したexact closureで全contract testを実行する | 充足 |
 | CI-003 | 必須 | dependency更新結果を追跡可能にする | 最新版test成功時は検証済みbaseline更新をpull requestとして提示し、失敗時は対象SHAとversionをjob summaryへ、contract failureをstep logへ残す | 充足 |
-| CI-004 | 必須 | secretを使うlive Galileo E2Eを自動化する | trusted pull request、`main`、`test.yml`の手動run、更新を検出したdaily run、`force_test=true`のdependency watchではrepository secretの`GALILEO_API_KEY`を必須にし、専用projectとlog streamでingestion、native Session、複数turn、privacy canaryをread-backし、secret欠落時はfail-closedにする | 外部依存 |
+| CI-004 | 必須 | secretを使うlive Galileo E2Eを自動化する | trusted pull request、`main`、`test.yml`の手動run、更新を検出したdaily run、`force_test=true`のdependency watchではrepository secretの`GALILEO_API_KEY`を必須にし、事前作成した専用projectで公式SDKが専用log streamを作成または再利用してConversation Qualityを有効化し、ingestion、native Session、複数turn、privacy canary、Conversation Qualityをread-backし、secret欠落時はfail-closedにする | 外部依存 |
 | CI-005 | 必須 | pull requestへsecretを安全に渡す | 同一repositoryの信頼済みpull requestだけをlive E2E対象とし、fork pull requestではskipし、`pull_request_target`を使わず、job permissionsを最小化する | 充足 |
 | CI-006 | 必須 | Workflow自体の供給網と実行量を制御する | third-party actionをcommit SHAでpinし、timeoutと最小権限を設定し、pull request runは同じrefの古いrunをcancelし、dependency watchはbaseline更新競合を避けるため直列実行する | 充足 |
 
-CI-004のGalileo project、log stream、API key、metric設定、read APIはrepository外の運用資源である。
+CI-004のGalileo project、log stream、API key、metric実行基盤、read APIはrepository外の運用資源である。
 そのため、Workflow実装の充足状態とlive Galileo受入の外部依存を分けて評価する。
 CI-001のWorkflowは実装済みだが、required checkとmerge protectionの有効化はGitHub repository設定に依存する。
 実Hermes互換checkの範囲はsource上のPluginManager、entry point、registration、全observer hookの呼び出しまでであり、Hermes本体のpackage install、実LLMを使うAgent loop、gateway起動は含まない。
 fork pull requestとDependabotだけはsecretを渡さずlive E2Eをsafe skipし、secret不要のlocal checksを必須にする。
 fork pull requestはlive受入を完了したことにならないため、merge前に同じcommitをtrusted branchで再検証する。
 更新がないdaily runはversion比較だけで完了し、live E2Eとsecret確認を行わない。
-Conversation Qualityを有効化したCI log streamでは、live E2Eのmetric assertionも必須にする。
+live E2EがConversation Qualityを有効化したCI log streamでは、metric assertionも必須にする。
 
 ## 初期受入ゲート
 

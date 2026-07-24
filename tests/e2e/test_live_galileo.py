@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import pytest
-from galileo.log_streams import get_log_stream
+from galileo import GalileoMetrics
+from galileo import LogStream as MetricLogStream
+from galileo.log_streams import (
+    create_log_stream,
+    enable_metrics,
+    get_log_stream,
+)
 from galileo.projects import get_project
 from galileo.resources.models import (
     LogRecordsIDFilter,
@@ -29,6 +35,23 @@ from hermes_galileo import hooks
 pytestmark = [pytest.mark.e2e, pytest.mark.live]
 
 _T = TypeVar("_T")
+
+
+def _status_code(exc: Exception) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if value is None:
+        value = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_retryable(exc: Exception) -> bool:
+    status_code = _status_code(exc)
+    if status_code is not None:
+        return status_code in {408, 409, 429} or status_code >= 500
+    return not isinstance(exc, (ImportError, TypeError, ValueError))
 
 
 def _records(response: Any) -> list[Any]:
@@ -57,6 +80,8 @@ def _poll(
         except AssertionError:
             raise
         except Exception as exc:
+            if not _is_retryable(exc):
+                raise AssertionError(f"Galileo operation failed permanently: {exc}") from exc
             last_error = exc
         time.sleep(interval)
     if last_error is not None:
@@ -107,6 +132,65 @@ def _conversation_quality_value(value: Any) -> Any | None:
     return None
 
 
+def _ensure_galileo_resources(
+    *,
+    project_name: str,
+    log_stream_name: str,
+) -> bool:
+    project = get_project(name=project_name)
+    assert project is not None, (
+        "pre-create the dedicated Galileo live E2E project and scope the API key to it"
+    )
+    log_stream = get_log_stream(name=log_stream_name, project_id=project.id)
+    if log_stream is None:
+        create_log_stream(name=log_stream_name, project_id=project.id)
+    return True
+
+
+def _enable_conversation_quality(
+    *,
+    project_name: str,
+    log_stream_name: str,
+) -> bool | None:
+    metric_stream = MetricLogStream.get(
+        name=log_stream_name,
+        project_name=project_name,
+    )
+    if metric_stream is None:
+        return None
+    target = _normalized(GalileoMetrics.conversation_quality.value)
+    configured = {_normalized(name) for name in metric_stream.get_metrics()}
+    if target in configured:
+        return True
+    assert not configured, (
+        "the Galileo live E2E log stream already has non-CI metrics; "
+        "use a dedicated empty log stream instead of replacing them"
+    )
+    local_metrics = enable_metrics(
+        project_name=project_name,
+        log_stream_name=log_stream_name,
+        metrics=[GalileoMetrics.conversation_quality],
+    )
+    assert not local_metrics, "Conversation Quality must run as a Galileo server metric"
+    return True
+
+
+def _conversation_quality_is_enabled(
+    *,
+    project_name: str,
+    log_stream_name: str,
+) -> bool | None:
+    metric_stream = MetricLogStream.get(
+        name=log_stream_name,
+        project_name=project_name,
+    )
+    if metric_stream is None:
+        return None
+    target = _normalized(GalileoMetrics.conversation_quality.value)
+    configured = {_normalized(name) for name in metric_stream.get_metrics()}
+    return True if target in configured else None
+
+
 @pytest.mark.timeout(600)
 def test_two_turns_share_live_galileo_session_and_are_readable(
     monkeypatch: Any,
@@ -123,6 +207,13 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
     assert log_stream_name, "GALILEO_LOG_STREAM is required"
     assert (hermes_source / "hermes_cli" / "plugins.py").is_file(), (
         "HERMES_AGENT_SOURCE must point to a real Hermes Agent checkout"
+    )
+    require_quality = (
+        os.environ.get(
+            "GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY",
+            "true",
+        ).lower()
+        == "true"
     )
 
     monkeypatch.syspath_prepend(str(hermes_source.resolve()))
@@ -175,6 +266,15 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
         hermes_galileo.register(context)
         runtime = hooks.get_runtime()
         assert runtime is not None, "Hermes Galileo runtime did not initialize"
+        assert runtime._processor.wait_until_ready(30)
+        _poll(
+            lambda: _ensure_galileo_resources(
+                project_name=project_name,
+                log_stream_name=log_stream_name,
+            ),
+            timeout=60,
+            interval=2,
+        )
 
         session_payload = {
             "session_id": raw_session_id,
@@ -187,6 +287,36 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
             **session_payload,
             sender_id=raw_sender_id,
         )
+
+        def native_session_ready() -> dict[str, Any] | None:
+            snapshot = runtime.health_snapshot()
+            if snapshot.get("native_session_failed", 0):
+                raise AssertionError(
+                    "Galileo native Session provisioning failed: "
+                    f"{snapshot.get('native_session_failures', 0)} failure(s)"
+                )
+            ready = snapshot.get("native_session_ready", 0) >= 1
+            drained = snapshot.get("native_session_deferred_spans", 0) == 0
+            return snapshot if ready and drained else None
+
+        _poll(native_session_ready, timeout=75, interval=1)
+        if require_quality:
+            _poll(
+                lambda: _enable_conversation_quality(
+                    project_name=project_name,
+                    log_stream_name=log_stream_name,
+                ),
+                timeout=60,
+                interval=2,
+            )
+            _poll(
+                lambda: _conversation_quality_is_enabled(
+                    project_name=project_name,
+                    log_stream_name=log_stream_name,
+                ),
+                timeout=60,
+                interval=2,
+            )
 
         for index, (_, input_text, output_text) in enumerate(expected_pairs, start=1):
             turn = {
@@ -270,20 +400,6 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
                 completed=True,
             )
 
-        assert runtime._processor.wait_until_ready(30)
-
-        def native_session_ready() -> dict[str, Any] | None:
-            snapshot = runtime.health_snapshot()
-            if snapshot.get("native_session_failed", 0):
-                raise AssertionError(
-                    "Galileo native Session provisioning failed: "
-                    f"{snapshot.get('native_session_failures', 0)} failure(s)"
-                )
-            ready = snapshot.get("native_session_ready", 0) >= 1
-            drained = snapshot.get("native_session_deferred_spans", 0) == 0
-            return snapshot if ready and drained else None
-
-        _poll(native_session_ready, timeout=75, interval=1)
         assert hermes_galileo.force_flush() is True
 
         def read_records() -> tuple[Any, list[Any], list[Any]] | None:
@@ -411,13 +527,6 @@ def test_two_turns_share_live_galileo_session_and_are_readable(
         # Galileo Search's numeric status_code is not the OTLP Span Status.
         # The wire-level E2E pins ERROR status and error.type before ingestion.
 
-        require_quality = (
-            os.environ.get(
-                "GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY",
-                "true",
-            ).lower()
-            == "true"
-        )
         if require_quality:
 
             def read_conversation_quality() -> Any | None:

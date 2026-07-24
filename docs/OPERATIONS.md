@@ -684,9 +684,13 @@ live E2Eには次のrepository secretとvariablesを使う。
 | variable | `GALILEO_CONSOLE_URL` | なし | custom deploymentのconsole endpoint |
 | variable | `GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY` | `true` | Conversation Qualityをlive受入の必須assertionにする |
 
-CI log streamではConversation Qualityを有効化し、通常は既定値`true`のまま使う。
+専用projectは事前に作成し、live E2Eは公式SDKで専用log streamを作成または再利用してConversation Qualityを送信前に有効化する。
+既存のConversation Quality設定は変更せず、metric未設定のstreamだけを構成する。
+別metricだけが設定されたstreamは上書きせずfail-closedにするため、productionや共有log streamを指定してはならない。
+通常は`GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY`を既定値`true`のまま使う。
 一時的な切り分けでこのvariableを`false`にしたrunはnative Sessionと複数turnのread-backまでを検証するが、Conversation Qualityの受入完了を証明しない。
-`GALILEO_API_KEY`にはproductionと分離したCI専用projectおよびlog streamだけを操作できる最小権限のkeyを使う。
+`GALILEO_API_KEY`には事前作成したCI専用projectへscopeしたeditor相当のkeyを使い、project作成権限は付与しない。
+このkeyは専用log streamの作成、metric設定、ingestion、read-backにだけ使用する。
 同一repositoryのbranchへpushできる主体だけをtrusted code authorとして扱い、forkとDependabotにはkeyを渡さない。
 組織policyで追加承認が必要な場合はlive jobをGitHub Environmentへ割り当てられるが、その場合はpull request checkに手動承認が必要になる。
 
