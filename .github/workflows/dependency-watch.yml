@@ -1,0 +1,321 @@
+name: dependency-watch
+
+on:
+  schedule:
+    # 05:17 JST. The non-round minute reduces load around the top of the hour.
+    - cron: "17 20 * * *"
+  workflow_dispatch:
+    inputs:
+      force_test:
+        description: Test the recorded latest versions even when no update was detected
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      updated: ${{ steps.versions.outputs.updated }}
+      hermes_sha: ${{ steps.versions.outputs.hermes_sha }}
+      galileo_version: ${{ steps.versions.outputs.galileo_version }}
+      resolved_json: ${{ steps.versions.outputs.resolved_json }}
+      baseline_hermes_sha: ${{ steps.versions.outputs.baseline_hermes_sha }}
+      baseline_galileo_version: ${{ steps.versions.outputs.baseline_galileo_version }}
+      baseline_resolved_json: ${{ steps.versions.outputs.baseline_resolved_json }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Query Hermes main and PyPI
+        id: versions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/check_dependency_updates.py
+
+      - name: Summarize dependency comparison
+        env:
+          BASELINE_GALILEO: ${{ steps.versions.outputs.baseline_galileo_version }}
+          BASELINE_HERMES: ${{ steps.versions.outputs.baseline_hermes_sha }}
+          BASELINE_RESOLVED: ${{ steps.versions.outputs.baseline_resolved_json }}
+          LATEST_GALILEO: ${{ steps.versions.outputs.galileo_version }}
+          LATEST_HERMES: ${{ steps.versions.outputs.hermes_sha }}
+          LATEST_RESOLVED: ${{ steps.versions.outputs.resolved_json }}
+          UPDATED: ${{ steps.versions.outputs.updated }}
+        run: |
+          {
+            echo "### Dependency watch"
+            echo
+            echo "| Dependency | Baseline | Latest |"
+            echo "| --- | --- | --- |"
+            echo "| Hermes Agent | \`$BASELINE_HERMES\` | \`$LATEST_HERMES\` |"
+            echo "| Galileo SDK | \`$BASELINE_GALILEO\` | \`$LATEST_GALILEO\` |"
+            echo
+            echo "<details><summary>Resolved Galileo dependency closure</summary>"
+            echo
+            echo "- Baseline: \`$BASELINE_RESOLVED\`"
+            echo "- Latest: \`$LATEST_RESOLVED\`"
+            echo
+            echo "</details>"
+            echo
+            echo "Update detected: **$UPDATED**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  compatibility:
+    name: Test latest Hermes and Galileo
+    needs: check
+    if: needs.check.outputs.updated == 'true' || inputs.force_test == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check out the detected Hermes commit
+        env:
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+        run: |
+          hermes_source="$RUNNER_TEMP/hermes-agent"
+          git init "$hermes_source"
+          git -C "$hermes_source" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$hermes_source" fetch --depth=1 origin "$HERMES_SHA"
+          git -C "$hermes_source" checkout --detach FETCH_HEAD
+          actual_sha="$(git -C "$hermes_source" rev-parse HEAD)"
+          if [ "$actual_sha" != "$HERMES_SHA" ]; then
+            echo "::error::Fetched Hermes SHA $actual_sha does not match detected SHA $HERMES_SHA"
+            exit 1
+          fi
+          echo "HERMES_AGENT_SOURCE=$hermes_source" >> "$GITHUB_ENV"
+
+      - name: Install the detected Galileo release
+        env:
+          GALILEO_RESOLVED_JSON: ${{ needs.check.outputs.resolved_json }}
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+        run: |
+          python scripts/install_latest_test_stack.py \
+            --galileo-version "$GALILEO_VERSION" \
+            --resolved-json "$GALILEO_RESOLVED_JSON"
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Run full local suite against latest dependencies
+        run: pytest -m "not live"
+
+      - name: Summarize latest compatibility result
+        if: always()
+        env:
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Latest dependency compatibility"
+            echo
+            echo "- Hermes Agent: \`$HERMES_SHA\`"
+            echo "- Galileo SDK: \`$GALILEO_VERSION\`"
+            echo "- Local contract result: **$RESULT**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  live-e2e:
+    name: Live E2E with latest Galileo
+    needs: [check, compatibility]
+    if: needs.check.outputs.updated == 'true' || inputs.force_test == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check out the detected Hermes commit
+        env:
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+        run: |
+          hermes_source="$RUNNER_TEMP/hermes-agent"
+          git init "$hermes_source"
+          git -C "$hermes_source" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$hermes_source" fetch --depth=1 origin "$HERMES_SHA"
+          git -C "$hermes_source" checkout --detach FETCH_HEAD
+          actual_sha="$(git -C "$hermes_source" rev-parse HEAD)"
+          if [ "$actual_sha" != "$HERMES_SHA" ]; then
+            echo "::error::Fetched Hermes SHA $actual_sha does not match detected SHA $HERMES_SHA"
+            exit 1
+          fi
+          echo "HERMES_AGENT_SOURCE=$hermes_source" >> "$GITHUB_ENV"
+
+      - name: Install the detected Galileo release
+        env:
+          GALILEO_RESOLVED_JSON: ${{ needs.check.outputs.resolved_json }}
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+        run: |
+          python scripts/install_latest_test_stack.py \
+            --galileo-version "$GALILEO_VERSION" \
+            --resolved-json "$GALILEO_RESOLVED_JSON"
+
+      - name: Require Galileo API key
+        env:
+          GALILEO_API_KEY: ${{ secrets.GALILEO_API_KEY }}
+        run: |
+          if [ -z "$GALILEO_API_KEY" ]; then
+            echo "::error::Configure the GALILEO_API_KEY repository secret before accepting dependency updates."
+            exit 1
+          fi
+
+      - name: Run live Galileo E2E against latest SDK
+        env:
+          GALILEO_API_KEY: ${{ secrets.GALILEO_API_KEY }}
+          GALILEO_API_URL: ${{ vars.GALILEO_API_URL }}
+          GALILEO_CONSOLE_URL: ${{ vars.GALILEO_CONSOLE_URL }}
+          GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY: ${{ vars.GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY || 'true' }}
+          GALILEO_LOG_STREAM: ${{ vars.GALILEO_LOG_STREAM || 'github-actions-live-e2e' }}
+          GALILEO_PROJECT: ${{ vars.GALILEO_PROJECT || 'hermes-galileo-ci' }}
+          HERMES_GALILEO_RUN_LIVE_E2E: "true"
+          HERMES_GALILEO_PSEUDONYM_SECRET: "synthetic-ci-pseudonym-v1"
+        run: pytest -v tests/e2e/test_live_galileo.py
+
+      - name: Summarize live Galileo result
+        if: always()
+        env:
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Latest live Galileo E2E"
+            echo
+            echo "- Hermes Agent: \`$HERMES_SHA\`"
+            echo "- Galileo SDK: \`$GALILEO_VERSION\`"
+            echo "- Galileo read-back result: **$RESULT**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  baseline-pr:
+    name: Propose tested baseline update
+    needs: [check, compatibility, live-e2e]
+    if: needs.check.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Record the tested versions
+        env:
+          GALILEO_RESOLVED_JSON: ${{ needs.check.outputs.resolved_json }}
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+        run: |
+          python scripts/check_dependency_updates.py \
+            --write \
+            --hermes-sha "$HERMES_SHA" \
+            --galileo-version "$GALILEO_VERSION" \
+            --resolved-json "$GALILEO_RESOLVED_JSON"
+
+      - name: Commit and push automation branch
+        id: publish
+        env:
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+        run: |
+          branch="automation/dependency-baseline"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add .github/dependency-baseline.json
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "chore: update tested dependency baseline"
+          remote_sha="$(git ls-remote --heads origin "refs/heads/$branch" | awk '{print $1}')"
+          if [ -n "$remote_sha" ]; then
+            git push \
+              --force-with-lease="refs/heads/$branch:$remote_sha" \
+              origin "HEAD:refs/heads/$branch"
+          else
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or refresh dependency update PR
+        if: steps.publish.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GALILEO_VERSION: ${{ needs.check.outputs.galileo_version }}
+          HERMES_SHA: ${{ needs.check.outputs.hermes_sha }}
+        run: |
+          branch="automation/dependency-baseline"
+          title="chore: update tested Hermes and Galileo baseline"
+          body="Automated daily compatibility validation succeeded.
+
+          - Hermes Agent main: \`$HERMES_SHA\`
+          - Galileo SDK: \`$GALILEO_VERSION\`
+          - Unit, integration, stub E2E, real Hermes contract, and Galileo live read-back tests passed.
+
+          Workflow: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          pr_number="$(gh api \
+            --method GET \
+            "repos/$GITHUB_REPOSITORY/pulls" \
+            -f state=open \
+            -f base=main \
+            -f head="$GITHUB_REPOSITORY_OWNER:$branch" \
+            --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --title "$title" --body "$body"
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body "$body"
+          fi
+
+      - name: Dispatch standard PR checks for the automation commit
+        if: steps.publish.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run test.yml --ref automation/dependency-baseline

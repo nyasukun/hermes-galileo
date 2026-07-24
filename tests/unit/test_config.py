@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+import hermes_galileo.config as config_module
 from hermes_galileo.config import ConfigurationError, Settings
 
 
@@ -29,6 +32,226 @@ def test_defaults_are_safe_and_predictable() -> None:
     assert settings.environment == "development"
     assert settings.service_name == "hermes-agent"
     assert settings.pseudonym_secret == ""
+    assert settings.native_sessions_enabled is True
+    assert settings.native_session_timeout_millis == 5_000
+
+
+def test_explicit_mapping_is_isolated_from_default_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_path = tmp_path / "config.yaml"
+    default_path.write_text("enabled: false\nsample_rate: 0.25\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "_default_config_path", lambda: default_path)
+
+    settings = Settings.from_env({})
+
+    assert settings.enabled is True
+    assert settings.sample_rate == 1.0
+
+
+def test_process_environment_loads_default_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_path = tmp_path / "config.yaml"
+    default_path.write_text(
+        "capture_content: true\nsample_rate: 0.25\nenvironment: staging\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "_default_config_path", lambda: default_path)
+    for env_name in (
+        "HERMES_GALILEO_CAPTURE_CONTENT",
+        "HERMES_GALILEO_SAMPLE_RATE",
+        "HERMES_GALILEO_ENVIRONMENT",
+        "GALILEO_LOGGING_DISABLED",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.capture_content is True
+    assert settings.sample_rate == 0.25
+    assert settings.environment == "staging"
+
+
+def test_process_environment_resolves_config_from_active_hermes_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_home = tmp_path / "profiles" / "first"
+    second_home = tmp_path / "profiles" / "second"
+    for hermes_home, environment in (
+        (first_home, "first-profile"),
+        (second_home, "second-profile"),
+    ):
+        config_path = hermes_home / "plugins" / "hermes_galileo" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(f"environment: {environment}\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    first_settings = Settings.from_env()
+    assert first_settings.environment == "first-profile"
+    assert first_settings.hermes_home == str(first_home.resolve())
+
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    second_settings = Settings.from_env()
+    assert second_settings.environment == "second-profile"
+    assert second_settings.hermes_home == str(second_home.resolve())
+
+
+def test_explicit_config_path_loads_all_supported_behavior_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "enabled: false",
+                "capture_content: true",
+                "capture_conversation_history: true",
+                "hash_user_ids: false",
+                "max_content_chars: 4096",
+                "max_collection_items: 50",
+                "sample_rate: 0.5",
+                "turn_ttl_seconds: 300",
+                "async_flush_on_turn_end: false",
+                "flush_timeout_millis: 2500",
+                "debug: true",
+                "environment: production",
+                "service_name: hermes-custom",
+                "native_sessions_enabled: false",
+                "native_session_timeout_millis: 1500",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    settings = Settings.from_env({}, config_path=config_path)
+
+    assert settings.enabled is False
+    assert settings.capture_content is True
+    assert settings.capture_conversation_history is True
+    assert settings.hash_user_ids is False
+    assert settings.max_content_chars == 4_096
+    assert settings.max_collection_items == 50
+    assert settings.sample_rate == 0.5
+    assert settings.turn_ttl_seconds == 300
+    assert settings.async_flush_on_turn_end is False
+    assert settings.flush_timeout_millis == 2_500
+    assert settings.debug is True
+    assert settings.environment == "production"
+    assert settings.service_name == "hermes-custom"
+    assert settings.native_sessions_enabled is False
+    assert settings.native_session_timeout_millis == 1_500
+
+
+def test_tracked_yaml_example_matches_the_supported_schema() -> None:
+    example_path = Path(__file__).resolve().parents[2] / "config.yaml.example"
+
+    settings = Settings.from_env({}, config_path=example_path)
+
+    assert settings.enabled is True
+    assert settings.capture_content is False
+    assert settings.native_sessions_enabled is True
+
+
+def test_environment_values_override_yaml_per_field(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "capture_content: false\nsample_rate: 0.25\nenvironment: yaml\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings.from_env(
+        {
+            "HERMES_GALILEO_CAPTURE_CONTENT": "true",
+            "HERMES_GALILEO_SAMPLE_RATE": "0.75",
+        },
+        config_path=config_path,
+    )
+
+    assert settings.capture_content is True
+    assert settings.sample_rate == 0.75
+    assert settings.environment == "yaml"
+
+
+def test_blank_environment_values_do_not_erase_yaml_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "enabled: false\nsample_rate: 0.25\nenvironment: yaml\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings.from_env(
+        {
+            "HERMES_GALILEO_ENABLED": " ",
+            "HERMES_GALILEO_SAMPLE_RATE": "",
+            "HERMES_GALILEO_ENVIRONMENT": "\t",
+        },
+        config_path=config_path,
+    )
+
+    assert settings.enabled is False
+    assert settings.sample_rate == 0.25
+    assert settings.environment == "yaml"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("[enabled, true]\n", "root must be a mapping"),
+        ("enabled: [\n", "is malformed"),
+        ('enabled: "yes"\n', "'enabled' must be a boolean"),
+        ("max_content_chars: many\n", "'max_content_chars' must be an integer"),
+        ("sample_rate: sometimes\n", "'sample_rate' must be a number"),
+        ("environment: 123\n", "'environment' must be a string"),
+        ("unknown_setting: true\n", "unknown config.yaml field"),
+        ("1: true\n", "field names must be strings"),
+    ],
+)
+def test_invalid_yaml_schema_raises_configuration_error(
+    tmp_path: Path,
+    source: str,
+    message: str,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match=message):
+        Settings.from_env({}, config_path=config_path)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "api_key",
+        "pseudonym_secret",
+        "project",
+        "log_stream",
+        "console_url",
+        "api_url",
+        "GALILEO_API_KEY",
+        "HERMES_GALILEO_PSEUDONYM_SECRET",
+    ],
+)
+def test_yaml_rejects_secret_and_routing_fields(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"{field_name}: must-not-leak\n", encoding="utf-8")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="cannot contain secrets or Galileo routing fields",
+    ) as error:
+        Settings.from_env({}, config_path=config_path)
+
+    assert "must-not-leak" not in str(error.value)
+
+
+def test_missing_explicit_config_path_raises_configuration_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="does not exist"):
+        Settings.from_env({}, config_path=tmp_path / "missing.yaml")
 
 
 def test_secret_settings_are_excluded_from_repr() -> None:
@@ -61,6 +284,8 @@ def test_explicit_values_are_trimmed_and_capture_requires_opt_in() -> None:
             "HERMES_GALILEO_ENVIRONMENT": " staging ",
             "HERMES_GALILEO_SERVICE_NAME": " agent-service ",
             "HERMES_GALILEO_PSEUDONYM_SECRET": " dedicated-hash-key ",
+            "HERMES_GALILEO_NATIVE_SESSIONS_ENABLED": "false",
+            "HERMES_GALILEO_NATIVE_SESSION_TIMEOUT_MILLIS": "1234",
         }
     )
 
@@ -77,6 +302,8 @@ def test_explicit_values_are_trimmed_and_capture_requires_opt_in() -> None:
     assert settings.environment == "staging"
     assert settings.service_name == "agent-service"
     assert settings.pseudonym_secret == "dedicated-hash-key"
+    assert settings.native_sessions_enabled is False
+    assert settings.native_session_timeout_millis == 1_234
 
 
 def test_custom_console_requires_an_explicit_api_route() -> None:
@@ -109,6 +336,9 @@ def test_custom_console_requires_an_explicit_api_route() -> None:
         ("HERMES_GALILEO_TURN_TTL_SECONDS", "86401"),
         ("HERMES_GALILEO_FLUSH_TIMEOUT_MILLIS", "99"),
         ("HERMES_GALILEO_FLUSH_TIMEOUT_MILLIS", "120001"),
+        ("HERMES_GALILEO_NATIVE_SESSIONS_ENABLED", "sometimes"),
+        ("HERMES_GALILEO_NATIVE_SESSION_TIMEOUT_MILLIS", "99"),
+        ("HERMES_GALILEO_NATIVE_SESSION_TIMEOUT_MILLIS", "120001"),
     ],
 )
 def test_invalid_explicit_values_raise_configuration_error(name: str, value: str) -> None:
@@ -138,6 +368,12 @@ def test_invalid_explicit_values_raise_configuration_error(name: str, value: str
             "100",
             "120000",
             "flush_timeout_millis",
+        ),
+        (
+            "HERMES_GALILEO_NATIVE_SESSION_TIMEOUT_MILLIS",
+            "100",
+            "120000",
+            "native_session_timeout_millis",
         ),
     ],
 )

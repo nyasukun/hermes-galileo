@@ -2,26 +2,172 @@ name: test
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: Python ${{ matrix.python-version }} / stub E2E
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12", "3.14"]
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install -e ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
-      - run: pytest
+
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Run unit, integration, and stub E2E tests
+        run: pytest -m "not live"
+
+  hermes-compat:
+    name: Hermes Agent compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check out the tested Hermes baseline
+        run: |
+          hermes_sha="$(python -c 'import json; print(json.load(open(".github/dependency-baseline.json"))["hermes_agent"]["sha"])')"
+          hermes_source="$RUNNER_TEMP/hermes-agent"
+          git init "$hermes_source"
+          git -C "$hermes_source" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$hermes_source" fetch --depth=1 origin "$hermes_sha"
+          git -C "$hermes_source" checkout --detach FETCH_HEAD
+          actual_sha="$(git -C "$hermes_source" rev-parse HEAD)"
+          if [ "$actual_sha" != "$hermes_sha" ]; then
+            echo "::error::Fetched Hermes SHA $actual_sha does not match baseline $hermes_sha"
+            exit 1
+          fi
+          echo "HERMES_AGENT_SOURCE=$hermes_source" >> "$GITHUB_ENV"
+
+      - name: Install the exact tested Galileo dependency closure
+        run: |
+          galileo_version="$(python -c 'import json; print(json.load(open(".github/dependency-baseline.json"))["galileo"]["version"])')"
+          resolved_json="$(python -c 'import json; data=json.load(open(".github/dependency-baseline.json")); print(json.dumps(data["galileo"]["resolved"], sort_keys=True, separators=(",", ":")))')"
+          python scripts/install_latest_test_stack.py \
+            --galileo-version "$galileo_version" \
+            --resolved-json "$resolved_json"
+
+      - name: Run real Hermes plugin contract
+        run: pytest -v tests/compat/test_hermes_latest.py
+
+  live-e2e:
+    name: Galileo live E2E
+    needs: [test, hermes-compat]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TRUSTED_EVENT: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
+
+    steps:
+      - name: Explain secret-safe fork policy
+        if: env.TRUSTED_EVENT != 'true'
+        run: |
+          echo "Live Galileo E2E is skipped for fork and Dependabot pull requests."
+          echo "The pull_request_target event is intentionally not used, so untrusted code never receives repository secrets."
+          echo "The complete local Galileo SDK to OTLP stub E2E already passed in the required test job."
+          {
+            echo "### Galileo live E2E skipped safely"
+            echo
+            echo "Fork and Dependabot pull requests do not receive \`GALILEO_API_KEY\`."
+            echo "Stub E2E remains mandatory; a maintainer can reproduce the change on a trusted branch for live validation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out repository
+        if: env.TRUSTED_EVENT == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        if: env.TRUSTED_EVENT == 'true'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check out the tested Hermes baseline
+        if: env.TRUSTED_EVENT == 'true'
+        run: |
+          hermes_sha="$(python -c 'import json; print(json.load(open(".github/dependency-baseline.json"))["hermes_agent"]["sha"])')"
+          hermes_source="$RUNNER_TEMP/hermes-agent"
+          git init "$hermes_source"
+          git -C "$hermes_source" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$hermes_source" fetch --depth=1 origin "$hermes_sha"
+          git -C "$hermes_source" checkout --detach FETCH_HEAD
+          actual_sha="$(git -C "$hermes_source" rev-parse HEAD)"
+          if [ "$actual_sha" != "$hermes_sha" ]; then
+            echo "::error::Fetched Hermes SHA $actual_sha does not match baseline $hermes_sha"
+            exit 1
+          fi
+          echo "HERMES_AGENT_SOURCE=$hermes_source" >> "$GITHUB_ENV"
+
+      - name: Require Galileo API key
+        if: env.TRUSTED_EVENT == 'true'
+        env:
+          GALILEO_API_KEY: ${{ secrets.GALILEO_API_KEY }}
+        run: |
+          if [ -z "$GALILEO_API_KEY" ]; then
+            echo "::error::Configure the GALILEO_API_KEY repository secret to run the required live E2E check."
+            exit 1
+          fi
+
+      - name: Install the exact tested Galileo dependency closure
+        if: env.TRUSTED_EVENT == 'true'
+        run: |
+          galileo_version="$(python -c 'import json; print(json.load(open(".github/dependency-baseline.json"))["galileo"]["version"])')"
+          resolved_json="$(python -c 'import json; data=json.load(open(".github/dependency-baseline.json")); print(json.dumps(data["galileo"]["resolved"], sort_keys=True, separators=(",", ":")))')"
+          python scripts/install_latest_test_stack.py \
+            --galileo-version "$galileo_version" \
+            --resolved-json "$resolved_json"
+
+      - name: Run Galileo ingestion and session read-back E2E
+        if: env.TRUSTED_EVENT == 'true'
+        env:
+          GALILEO_API_KEY: ${{ secrets.GALILEO_API_KEY }}
+          GALILEO_API_URL: ${{ vars.GALILEO_API_URL }}
+          GALILEO_CONSOLE_URL: ${{ vars.GALILEO_CONSOLE_URL }}
+          GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY: ${{ vars.GALILEO_E2E_REQUIRE_CONVERSATION_QUALITY || 'true' }}
+          GALILEO_LOG_STREAM: ${{ vars.GALILEO_LOG_STREAM || 'github-actions-live-e2e' }}
+          GALILEO_PROJECT: ${{ vars.GALILEO_PROJECT || 'hermes-galileo-ci' }}
+          HERMES_GALILEO_RUN_LIVE_E2E: "true"
+          HERMES_GALILEO_PSEUDONYM_SECRET: "synthetic-ci-pseudonym-v1"
+        run: pytest -v tests/e2e/test_live_galileo.py

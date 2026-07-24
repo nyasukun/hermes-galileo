@@ -95,7 +95,7 @@ def initialize(settings: Settings | None = None) -> TelemetryRuntime | None:
         missing = resolved.missing_required()
         if missing:
             logger.warning(
-                "hermes-galileo disabled: set %s in ~/.hermes/.env",
+                "hermes-galileo disabled: set %s in the active Hermes .env",
                 ", ".join(missing),
             )
             return None

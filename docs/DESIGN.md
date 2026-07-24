@@ -6,22 +6,40 @@
 
 ## 設計の境界
 
-現行設計は、Hermesの観測eventをOpenTelemetry spanへ変換し、Galileo公式SDKで直接exportする。
-Galileo固有の認証、header生成、endpoint解決、batch exportは公式SDKへ委譲する。
+v1のDirect profileは、Hermesの観測eventをOpenTelemetry spanへ変換するdata planeと、Hermes sessionをGalileo native Sessionへ対応づける制御面を持つ。
+Galileo固有の認証、header生成、endpoint解決、batch export、Session APIは公式SDKへ委譲する。
 
-現行実装が作るのはOpenTelemetry traceであり、Galileo native sessionをAPIで作成または終了する処理ではない。
-会話のまとまりは、各root spanの`gen_ai.conversation.id`に同じHermes session IDを設定して表す。
-Galileo native sessionのprovisioning、external ID設定、lifecycle管理は将来拡張とする。
+data planeは公式`GalileoSpanProcessor`を使う。
+Session制御面は公式`GalileoLogger(project, log_stream).start_session(external_id=...)`を使う。
+返却されたGalileo Session UUIDを`galileo.session.id`として関連spanへ設定し、複数のHermes turn traceを一つのnative Sessionへ入れる。
 
-## 現行アーキテクチャ
+Hermes session IDはprocess内の相関にだけ使う。
+Galileoへは、`hermes:`接頭辞とHMAC-SHA-256仮名値を組み合わせたexternal IDを送り、同じ仮名値を`gen_ai.conversation.id`と`hermes.session.id`へ設定する。
+raw Hermes session IDはspan、Session metadata、log、healthへ出さない。
+
+Direct profileの配送保証は、process内のlocal acceptanceとbest effort flushまでである。
+OTLP data-planeの429 retry、`Retry-After`、partial success、永続WAL、tail samplingはadapterへ実装せず、必要な環境では別のCollector profileが所有する。
+
+## v1アーキテクチャ
 
 ```mermaid
 flowchart LR
-    H["Hermes Agent lifecycle hooks"] --> D["Fail-open dispatcher"]
+    H["Hermes Agent lifecycle hooks"] --> Z["Active HERMES_HOME profile gate"]
+    Z -->|"Bound profile"| D["Fail-open dispatcher"]
+    Z -->|"Different profile"| K["Drop telemetry and count mismatch"]
     D --> R["Turn and child-span state mapper"]
+    D --> Q["Bounded Session request queue"]
+    Q --> W["Fixed daemon Session workers<br/>single-flight per Hermes session"]
+    W --> A["Official GalileoLogger.start_session<br/>HMAC external ID"]
+    A --> N["Galileo native Session"]
+    A --> M["Bounded Session mapping"]
+    M --> R
     R --> P["Privacy normalization and redaction"]
     P --> T["Isolated OpenTelemetry TracerProvider"]
-    T --> X["Deferred span processor"]
+    T --> X["Session-aware deferred span processor"]
+    X -->|"Session pending"| Y["Bounded pending-span buffer"]
+    M -->|"Resolved: attach galileo.session.id"| Y
+    Y -->|"Timeout or failure: replay without Session ID"| X
     X -->|"SDK not ready: on_end"| B["Startup buffer<br/>max 2048, drop oldest"]
     X --> C["Daemon connector<br/>health, login, current user<br/>transient retry with jitter"]
     C -->|"Non-retryable error or SDK config conflict"| E["Failed state<br/>stop retry and count drops"]
@@ -34,6 +52,8 @@ flowchart LR
     F --> X
     R --> S["Health snapshot"]
     X --> S
+    Q --> S
+    M --> S
 ```
 
 Hermes eventを受けるdispatcherは、callback引数を固定schemaへ強制しない。
@@ -49,6 +69,22 @@ span属性を設定する前にprivacy変換を行い、加工済みの値だけ
 
 TracerProviderはこの連携専用であり、resource、sampler、deferred processorを所有する。
 外部からProviderとprocessorを注入した場合は、呼び出し元がlifecycleを所有する。
+
+### 設定解決とprofile routing境界
+
+runtime初期化時にHermesの`get_hermes_home()`を使い、active profileの`$HERMES_HOME/plugins/hermes_galileo/config.yaml`を解決する。
+Hermes moduleを利用できないstandalone環境ではprocessの`HERMES_HOME`を使い、未指定時はplatform defaultへfallbackする。
+設定値は空でない環境変数、YAML、組み込み既定値の順で解決する。
+空の環境変数は未指定として扱い、同じfieldのYAML値を消さない。
+
+YAMLはtelemetry shapingの許可fieldだけを受け付ける。
+credential、pseudonym secret、project、log stream、console URL、API URLはYAMLで拒否し、active profileのsecret環境へ限定する。
+構文error、mapping以外のroot、未知field、型違反、範囲違反は`ConfigurationError`とし、adapterだけを無効化してHermesを継続する。
+
+初期化したruntimeはactive Hermes homeの正規化pathへbindingする。
+hook admission時に現在のHermes homeがbindingと異なる場合は、process globalなGalileo routingへの誤配送を避けるためeventをdropし、`profile_scope_mismatches`を増やす。
+Galileo SDKのcredentialとroutingがprocess globalであるため、v1はmultiplexed process内でprofile別runtimeを作らない。
+複数profileを観測するdeploymentは一つのHermes processを一つのprofileへ割り当てる。
 
 ### Deferred SDK初期化
 
@@ -80,13 +116,52 @@ deferred processorは`connecting`、`replaying`、`ready`、`failed`、`stopping
 現行galileo-coreは各bootstrap requestで既定最大60秒待ち得るため、connector daemonはruntime shutdown後もconstructor内で継続する場合がある。
 runtimeが`stopped`へ遷移した後もconstructor、startup replay、またはcleanupを行うconnector threadが生存している間は、`connector_cleanup_deferred=true`を公開する。
 
+### Native Sessionの非同期解決
+
+Session制御面は、trace processorとは別の二つのdaemon workerで実行する。
+hook callbackはraw Hermes session IDをprivacy境界内でHMAC external IDへ変換し、network完了を待たず、その仮名値だけを最大512件のqueueへ登録する。
+同じHMAC external IDに対する同時要求はsingle-flightにまとめる。
+
+keyには専用pseudonym secretを優先し、未設定時だけGalileo API keyを使う。
+Session worker、queue、local mappingはraw Hermes session IDを保持しない。
+external IDは`hermes:{hmac}`とし、Session loggerへtrusted configのprojectとlog streamを明示する。
+Session名は固定の`Hermes Agent session`とし、metadataには`service.name`と`deployment.environment.name`だけを設定する。
+
+公式`start_session(external_id=...)`は、対象projectとlog streamに同じexternal IDのSessionがあれば再利用し、なければ作成してGalileo Session UUIDを返す。
+adapterは返却UUIDを最大512件のlocal mappingへ保存し、同じHermes sessionに属する全spanへ`galileo.session.id`として設定する。
+同じHMAC仮名値を`gen_ai.conversation.id`と`hermes.session.id`へ設定するため、native SessionとOpenTelemetry上の会話相関を明示的に照合できる。
+mappingが上限へ達した場合は最終利用時刻が最も古いfailed mappingだけを解放する。
+pendingまたはready mappingしかない場合は既存会話の対応を維持し、新しい会話だけをSessionなしでfail-openして`native_session_capacity_rejections`を増やす。
+failed mappingの解放数は`native_session_mapping_evictions`へ記録し、後続turnは同じexternal IDで公式SDKの既存Session再利用を行う。
+
+Session解決中に終了したspanは、最大4096件のpending-span bufferへ保持する。
+Session UUIDを解決できた場合は属性を付けてreplayする。
+timeout、queue overflow、pending-span buffer overflow、Session API失敗の場合は、Hermesの処理とtrace生成を止めず、`galileo.session.id`なしでspanをreplayする。
+このfail-open経路はSession完全性を低下させるため、capacity dropとtimeoutをhealthへ公開する。
+Session timeoutはlocal mappingとpending spanのdeadlineであり、公式SDK内で実行中の同期`start_session()` callをcancelしない。
+二つのworkerがSDK call内で停止した場合は後続queueも期限切れになり得るため、実行中call数を`native_session_worker_calls_inflight`へ公開する。
+
+一つのlocal mappingに対する`start_session`は一回だけ実行し、独自retryは行わない。
+失敗またはtimeoutしたmappingはfinalize、reset、eviction、process再起動までfailedとして保持する。
+
+`on_session_end`は一回のturnを閉じるeventであり、native Session対応を破棄しない。
+`on_session_finalize`と`on_session_reset`は、open spanを閉じた後にlocal mappingを解放する。
+top-level parentのturn終了、finalize、resetより前に開始されたsubagent delegationは、childが実行中でもqueue待ちでもcanonicalな`subagent_stop`まで保持する。
+その間はmappingとaliasの解放を`pending_session_releases`へ遅延する。
+Session解決中の場合は`release_after_resolution`として扱い、hookを待たせず、成功、timeout、cancel callbackで同じgenerationへ束縛されたpending spanだけを解放してからmappingを破棄する。
+同じexternal IDの新lifecycleが解決前に始まった場合はlocal release予約を取り消し、解決後のmappingを新turnでも維持する。
+Galileo SDKの`clear_session()`はloggerのcurrent Sessionを解除するだけで、server上のSessionを終了状態へ変更しないため、remote closeとしては扱わない。
+
+process再起動後はlocal mappingが失われるが、同じHMAC external IDで`start_session`を再実行して既存Sessionを再利用する。
+複数processが同じ未作成external IDを同時解決する場合の一意性はGalileo APIへ依存するため、live E2Eで重複Sessionを確認する。
+
 ## Eventとspanの対応
 
-現行実装の主な対応は次のとおりである。
+v1の主な対応は次のとおりである。
 
 | Hermes event | 状態遷移 | OpenTelemetry上の結果 |
 | --- | --- | --- |
-| session start | session metadataを記録 | spanは開始しない |
+| session start | native Sessionの非同期作成または再利用を要求 | spanは開始しない |
 | pre LLM call | turnを開始 | root Agent spanを開始 |
 | post LLM call | turn outputを記録 | rootへoutputとresponse modelを追加 |
 | pre API request | API childを開始 | LLM `CLIENT` spanを開始 |
@@ -98,11 +173,11 @@ runtimeが`stopped`へ遷移した後もconstructor、startup replay、または
 | post approval response | approval childを終了 | choiceとdeciderを追加 |
 | subagent start | delegationを開始 | Agent `INTERNAL` spanを開始 |
 | subagent stop | delegationを終了 | summary、status、durationを追加 |
-| session end | active turnを終了 | root summaryとfinal statusを追加 |
-| session finalizeまたはreset | active turnを終了 | lifecycle理由を付けてrootを終了 |
+| session end | active turnを終了してSession mappingを維持 | root summaryとfinal statusを追加 |
+| session finalizeまたはreset | active turnを終了し、解決済みmappingを破棄する。解決中ならcallback後の解放を予約する | lifecycle理由を付けてrootを終了 |
 
-session startがGalileo native sessionを作らない点に注意が必要である。
-session IDは、同じ会話に属する複数traceを`gen_ai.conversation.id`でgroupingするために使う。
+session startが欠けた場合も、最初の会話eventがnative Session解決を要求する。
+通常時は、同じ会話に属する複数traceが同じ`gen_ai.conversation.id`と`galileo.session.id`を持つ。
 
 ### 推奨span階層
 
@@ -126,14 +201,18 @@ root spanは、一意な論理API request ID数、tool call数、tool名、error
 
 | 対象 | 優先するID | fallback | 制約 |
 | --- | --- | --- | --- |
-| 会話 | `session_id` | `task_id`またはthread ID | fallbackはGalileo native sessionではない |
+| process内の会話 | raw `session_id` | `task_id`またはthread ID | raw値はprocess外へ出さない |
+| export上の会話 | `hermes:`接頭辞付きsession HMAC | fallback IDを同じ方法でHMAC | `gen_ai.conversation.id`と`hermes.session.id`へ同じ値を設定 |
+| Galileo native Session | `start_session`の返却UUID | なし | 解決失敗時は属性なしでfail-open |
 | ターン | `turn_id` | session内のactive turn | 同一sessionの同時turnを識別できない場合がある |
 | API要求 | `api_request_id` | task IDとcall count | call count欠落時の一意性は保証しない |
 | tool call | `tool_call_id` | task IDとtool名 | 同名toolの並行実行で衝突し得る |
 | approval | `tool_call_id` | session key、pattern key、commandの組み合わせ | turnは`turn_id`、taskまたは唯一のactive turnから別に解決する |
 | subagent | `child_session_id` | fallbackなし | ID欠落時はspanを開始しない |
 
-Hermesがstable IDを供給した場合、runtimeはその値をidentityとして保持する。
+Hermesがstable IDを供給した場合、runtimeはその値をprocess内のidentityとして保持する。
+session IDだけはprivacy境界を越える前にHMAC仮名値へ変換し、raw値を属性へ保持しない。
+subagentのchild sessionはexport上の会話IDとしてtop-level parentのHMACを使い、child自身のHMACは`hermes.subagent.child_session_id`だけに保持する。
 retry時は同じ論理API要求のIDを維持し、各試行を別spanにする。
 各試行へ1始まりの`hermes.api.attempt`を設定し、rootのAPI call数は試行数ではなく一意な論理要求数を数える。
 
@@ -146,6 +225,22 @@ session IDがないapprovalなどでは、一意なturn ID、一意なtask ID、
 turn、child span、subagent delegationは、再入可能lockで保護した辞書に保持する。
 一つのcallback内で、期限切れstateの回収、対象stateの探索、span更新を直列化する。
 
+Session mapping、Session要求queue、解決待ちspanも別の有界状態として保持する。
+同じHermes sessionから得たHMAC external IDの解決はsingle-flightにし、Session workerの結果を待つturn間で共有する。
+
+subagent連携のcanonicalなevent順序は、`subagent_start`の後にchild sessionとchild turnのeventが続く形である。
+child eventが先着した場合も、まだexportされていないactive spanとSession解決待ちの終了spanは、後着した`subagent_start`でparentのnative Session keyへ再束縛する。
+再束縛したspanにはparent native SessionのUUIDを設定してexportする。
+すでにexport済みのchild spanは再束縛できない。
+child用`start_session`のnetwork requestがすでに始まった場合もremote Sessionを取り消せず、遅れて返った結果をlocal mappingから無視するだけである。
+Session解決のcallbackはgenerationを持ち、古いcallbackは同じexternal IDで再開した新turnへ作用しない。
+LLM、tool、approval、subagent spanはroot turnが選んだgenerationを継承し、turn途中でmappingが回収されても新しいgenerationを作らない。
+
+session aliasは最大512件である。
+上限ではactive turn、session metadata、delegationのいずれにも参照されないaliasだけを解放する。
+すべてのaliasがactiveなら新しいsubagent spanとaliasの作成を省略し、`session_alias_capacity_rejections`を増やして既存会話の相関を維持する。
+`subagent_stop`ではchild session metadataを解放し、完了済みaliasを次のcapacity回収対象にする。
+
 同時turnの上限は512件である。
 上限に達すると、最終更新時刻が最も古いturnを`state_capacity_exceeded`として終了する。
 この処理はturn stateのmemory上限を作る。
@@ -156,7 +251,8 @@ TTL sweepはhookを受信した時に実行される。
 processが完全にidleの場合は、次のhookまたはshutdownまで期限切れstateが残る。
 
 同じchildの開始を重複して受けた場合、先に開いていたspanを`duplicate_start`として閉じる。
-turn終了時に開いたままのchildは`abandoned`、subagentは`abandoned_subagent`として閉じる。
+turn終了時に開いたままのLLM、tool、approval child spanは`abandoned`として閉じる。
+subagent delegationはbackground実行との競合を避けるため`subagent_stop`まで保持し、stopが届かない場合はprocess shutdownで`shutdown`として閉じる。
 開始eventが欠けた終了eventでは、`hermes.span.synthesized=true`のspanを補完する。
 
 ## OpenTelemetry Provider
@@ -187,15 +283,17 @@ root Agent spanには、次の属性群を設定する。
 - `gen_ai.agent.name`
 - `gen_ai.request.model`
 - `gen_ai.conversation.id`
+- `galileo.session.id`
 - `gen_ai.input.messages`
 - `gen_ai.output.messages`
 - OpenInference互換の`input.value`と`output.value`および`text/plain` MIME type
 - Hermes session、turn、task、platform、schema version
 
-Hermes session IDは現行のconversation groupingに使う。
-session ID自体が個人情報を含む環境では、upstreamでopaque IDを発行するか、将来のsession ID仮名化を有効にする必要がある。
+`gen_ai.conversation.id`と`hermes.session.id`には、top-level Hermes session IDのHMAC仮名値を使う。
+`galileo.session.id`には公式Session APIが返したUUIDを使う。
+raw Hermes session IDは属性へ設定しない。
 canonicalな`pre_llm_call`にproviderがなく、後続API eventにproviderがある場合は、root Agent spanもそのproviderで補完する。
-subagent delegation spanには、operation、`provider=hermes`、agent名、inputとoutput、親子session ID、roleを設定する。
+subagent delegation spanには、operation、`provider=hermes`、agent名、inputとoutput、親子session IDのHMAC仮名値、roleを設定する。
 現行のsubagent delegation spanは`input.mime_type`と`output.mime_type`を設定しない。
 
 ### LLM span
@@ -279,11 +377,16 @@ Tool errorを含め、同じmessageをcustom属性へ重複保存しない。
 `error.type`は100文字以下のbounded識別子へ正規化する。
 現行実装は許可語彙を強制しないため、upstreamはerror classなどの低cardinality taxonomyを渡す必要がある。
 
-user IDの既定仮名化は、専用pseudonym secretを優先し、未設定時はGalileo API keyを使うHMAC-SHA-256の短縮値である。
-どちらのsecretもない状態で仮名化関数を直接使う場合だけ、SHA-256へfallbackする。
+user IDの既定仮名値は、専用pseudonym secretを優先し、未設定時はGalileo API keyを使うHMAC-SHA-256の短縮値である。
+Hermes session IDは同じkey選択を使うが、external IDの衝突を避けるため64桁のHMAC digestを保持する。
+user ID仮名化をどちらのsecretもない状態で直接使う場合だけ、SHA-256へfallbackする。
 専用secretを設定し、key versionとrotation期間をまたぐ相関方針を運用で管理することが目標設計になる。
 HMACであっても仮名化であり、匿名化とは扱わない。
 API keyとpseudonym secretは`Settings` dataclassの`repr`対象から外し、設定objectを誤ってlogへ出しても値を含めない。
+
+Session external IDには`hermes:`とHermes session IDのHMAC仮名値だけを使う。
+Session名とmetadataにはraw session ID、user ID、prompt、tool payloadを入れない。
+Session loggerが返すGalileo UUIDは機密情報ではないが、高cardinality値としてmetric labelへ使わない。
 
 文字数上限は、serialization後の文字列へ適用する。
 `gen_ai.input.messages`と`gen_ai.output.messages`は上限超過時も有効なJSONを保つ。
@@ -325,9 +428,13 @@ turn終了時のflushはbackground threadへ要求する。
 複数のturnが短時間に終了した場合、event flagによって要求をまとめる。
 flush失敗はwarningへ記録し、Agentへ伝播しない。
 
-shutdownはlockで保護したadmission gateを閉じ、以後のhookを拒否し、open turnを`shutdown`として閉じる。
+shutdownはlockで保護したadmission gateを閉じ、以後のhookを拒否する。
 packageの終了経路は共有runtimeをunpublishしてからdrainを始める。
 flush timeoutは100ミリ秒から120000ミリ秒の範囲で設定する。
+
+Session coordinatorのpending解決をnative Session期限まで待ち、期限切れならcancel callbackによってpending spanをSession IDなしでreplayする。
+その後、open turnを`shutdown`として閉じ、残ったdeferred spanをfail-open終了してからSession coordinatorの新規要求を止める。
+Session workerはdaemon threadであり、shutdownのjoin deadlineを超えて生存する場合は`native_session_worker_cleanup_deferred=true`で公開する。
 
 background flush workerはflush timeoutまで停止を待つ。
 期限を超えた場合はProvider cleanupをdaemon threadへ延期し、flush完了後に一度だけ実行する。
@@ -369,51 +476,86 @@ process crash時の未送信spanを復元する保証はない。
 - `connector_cleanup_deferred`
 - `provider_cleanup_deferred`
 - `delegate_cleanup_deferred`
+- `native_sessions_enabled`
+- `session_aliases`
+- `pending_session_releases`
+- `native_session_state`
+- `native_session_pending`、`native_session_ready`、`native_session_failed`
+- `native_session_mappings`、`native_session_queue_depth`
+- `native_session_callbacks_inflight`
+- `native_session_attempts`、`native_session_resolved`、`native_session_failures`
+- `native_session_timeouts`、`native_session_capacity_rejections`、`native_session_mapping_evictions`
+- `native_session_cancelled`、`native_session_release_pending`
+- `native_session_deferred_spans`、`native_session_deferred_span_drops`
+- `native_session_worker_calls_inflight`、`native_session_worker_cleanup_deferred`
+- `profile_scope_enforced`、`profile_scope_mismatches`
+- `session_alias_capacity_rejections`
 
 API keyは返さない。
 `dropped_spans`はstartup bufferのoverflow、replay失敗、恒久初期化失敗、failed、stopping、stopped状態で終了したspan、shutdown期限切れを数える。
 ready後のdelegate enqueue失敗、Galileoへの最終送信成功、SDK内部queue量、partial rejection、export latencyは含まない。
+Session healthは件数と状態だけを返し、raw Hermes session ID、HMAC値、Galileo Session UUID、HMAC keyを返さない。
 `provider_cleanup_deferred`は、background flusherがruntimeのdeadlineを超え、Provider cleanupがdaemonへ延期されたことを示す。
 `delegate_cleanup_deferred`はdelegate cleanup threadの実行中を示し、shutdown返却後も`true`ならdeferred processorのdeadlineを超えて継続している。
 `connector_cleanup_deferred`は、runtimeが`stopped`でもconnector threadがconstructor、startup replay、またはその後のcleanup内で継続していることを示し、thread終了後に`false`へ戻る。
 host processがHTTP health endpointを提供する場合は、このsnapshotをprocess状態の一部として使い、exporter状態を別metricで補う。
 
-## OTLP transportの現行制約
+## Direct profileのOTLP配送境界
 
 現行依存関係で確認したOpenTelemetry Python 1.44.0のOTLP HTTP exporterは、connection error、HTTP 408、HTTP 500から599だけを再試行対象にする。
 HTTP 429は再試行対象ではなく、`Retry-After` headerも利用しない。
 また、HTTP 2xxではresponse bodyを解析せず即座に成功を返すため、HTTP 200の`partialSuccess`に含まれるrejected span数とmessageをruntimeから取得できない。
 
-したがって、起動時のSDK接続retryとstartup bufferが実装済みでも、REL-007の429および`Retry-After`対応とREL-008のpartial success観測は未充足である。
-これらを必須にする場合は、公式SDKの更新確認、processorまたはexporter wrapper、もしくはCollector profileを設計する。
+この挙動はDirect profileで採用するdependency contractであり、adapterの未充足必須要件ではない。
+起動時のSDK接続retryとSession APIの制御面はadapterが所有するが、ready後のOTLP batch retryとは別の処理である。
+429、`Retry-After`、partial successの観測が必要な環境は、data-plane retryと応答解析を所有するCollector profileへ移行する。
 根拠は、[OpenTelemetry Python 1.44.0 OTLP HTTP trace exporter](https://github.com/open-telemetry/opentelemetry-python/blob/v1.44.0/exporter/opentelemetry-exporter-otlp-proto-http/src/opentelemetry/exporter/otlp/proto/http/trace_exporter/__init__.py)と[同versionのHTTP retry判定](https://github.com/open-telemetry/opentelemetry-python/blob/v1.44.0/exporter/opentelemetry-exporter-otlp-proto-http/src/opentelemetry/exporter/otlp/proto/http/_common/__init__.py)にある。
 
 ## 検証済みのexport境界
 
-wire E2Eは、公式SDKが行うhealth check、API key login、current user取得と、OTLP protobuf送信までをfake Galileo serverで検証する。
+wire E2Eは、公式SDKが行うSession作成または再利用、health check、API key login、current user取得、OTLP protobuf送信までをfake Galileo serverで検証する。
 通常時は、OTLP requestの認証header、resource、projectとlog stream、rootからLLMおよびToolへの親子関係、token mapping、会話履歴のOpt-In、privacy canaryを検査する。
+Session contractでは、HMAC external ID、同じHermes sessionのsingle-flight、返却UUIDの`galileo.session.id`付与、複数turnの共有、timeout時fail-openを検査する。
 failure matrixは、401、429、503、408、connection reset、read timeout、HTTP 200 partial success、large payloadを再現する。
 503、408、connection resetのretryでは、trace ID、span ID、serialize済みrequest bodyが変わらないことを検査する。
-429のno-retryとpartial successの非検出も、現行依存関係の既知gapとして固定する。
+429のno-retryとpartial successの非検出も、Direct profileのdependency contractとして固定する。
 Approvalのturn相関、Tool配下の親子関係、同一commandとpatternを持つparallel approvalの交差しないresponse相関はintegration testで検証する。
 
-このE2Eは公式SDKを含む送信wireを検証するが、実Galileoへ保存されたtraceのread-backまでは検証しない。
-実Galileo上のrouting、表示、評価metric、重複、delivery latencyは外部環境に依存するlive受入として残る。
+このE2Eは公式SDKを含む送信wireを検証するが、実Galileoへ保存されたSessionとtraceのread-backまでは検証しない。
+実Galileo上のSession再利用、routing、表示、Conversation Qualityを含む評価metric、重複、delivery latencyは外部環境に依存するlive受入として残る。
 
-## 将来のGalileo native session
+## Session単位の会話評価
 
-Galileo native session provisioningを導入する場合は、現行のconversation groupingから独立した設計変更として扱う。
-少なくとも次の判断が必要になる。
+GalileoのConversation QualityはSession単位でtraceのinputとoutputを評価する。
+したがって、同metricを利用する会話評価profileは、二つ以上のHermes turn traceを同じnative Sessionへ入れ、各root traceにprivacy審査済みのinputとoutputを持たせる。
 
-- sessionを作成する時点と、作成失敗時のfail-open動作
-- Hermes session IDとGalileo external IDの対応
-- 複数processが同じHermes sessionを扱う場合の冪等性
-- session終了、reset、retention、再開の意味
-- session APIのretry、重複作成、credential scope
-- content policyとsession metadata policyの統一
+通常profileの`HERMES_GALILEO_CAPTURE_CONTENT`は既定の`false`を維持する。
+会話評価profileだけが明示的にcontent取得を有効化し、data ownerとsecurity reviewerが承認したfixtureまたは本番dataへ限定する。
+content取得を有効にしても、secret redaction、hidden reasoning除去、collection上限、文字数上限を解除しない。
 
-native session作成に失敗してもtrace exportを止めないことを基本方針とする。
-導入時は、`gen_ai.conversation.id`によるgroupingとの二重管理をE2Eで検証する。
+Conversation Qualityの算出、metric設定、judge model、結果のread-backはGalileo側の外部依存である。
+adapterが保証するのは、評価対象となるnative Session、複数trace、trace inputとoutputの構造までである。
+live E2Eは、対象SessionにConversation Qualityが計算されたことをGalileo APIまたは画面で確認する。
+
+## GitHub Actionsによる互換性検証
+
+pull request用Workflowは、support対象Python matrixでlint、format check、unit、integration、stub wire E2Eを実行する。
+secretを使わないjobをrequired checkとし、外部Galileoの可用性で通常のpull requestを不安定にしない。
+
+live Galileo E2Eは、同一repositoryの信頼済みpull request、`main`へのpush、`test.yml`の手動run、更新を検出したdaily run、`force_test=true`のdependency watchで起動する。
+これらのrunではrepository secretの`GALILEO_API_KEY`を必須にし、欠落時はfail-closedにする。
+fork pull requestとDependabotだけを明示的なsafe skip対象とし、secret不要のlocal checksは実行する。
+untrusted codeをsecret付きで実行し得る`pull_request_target`は使わない。
+
+dependency watch用Workflowは日次scheduleと手動実行を持つ。
+Hermes mainのcommit SHA、PyPI project metadataが示すGalileo current release、およびpipが解決したGalileoの全依存closureを検証済みbaselineと比較し、変更がある場合だけ検出したexact closureで同じcontract suiteを実行する。
+変更がないdaily runはversion比較だけで完了し、live E2Eとsecret確認を行わない。
+成功時はbaseline更新をpull requestとして提示し、失敗時は対象SHAとversionをjob summaryへ、contract failureをstep logへ残す。
+
+Workflowは最小permissionsとjob timeoutを設定する。
+pull request用Workflowは同じrefの古いrunをcancelし、dependency watchはbaseline更新競合を避けるため同じgroupを直列実行する。
+third-party actionは可変tagではなくcommit SHAへpinする。
+GitHub-hosted runner、GitHub API、PyPI、live Galileoはrepository外の依存であり、adapter実装のtest結果と外部サービス障害をjob上で区別する。
 
 ## ADR-001 公式GalileoSpanProcessor
 
@@ -444,7 +586,8 @@ API key、project、log stream、custom console URL、custom API URLは公式環
 
 ### 棄却した案
 
-Galileo Loggerを直接呼ぶ案は、既存のOpenTelemetry traceと二重のlifecycle管理を生むため採用しない。
+Galileo Loggerでtraceとspanも直接記録する案は、OpenTelemetry traceと二重のlifecycle管理を生むため採用しない。
+Galileo LoggerはADR-004のnative Session制御面にだけ使う。
 OTLP endpointとheaderを直接組み立てる案は、公式SDKを使うという要件と保守境界に反するため採用しない。
 
 根拠は、[Galileo OpenTelemetry統合概要](https://docs.galileo.ai/sdk-api/third-party-integrations/opentelemetry-and-openinference)にある。
@@ -485,7 +628,7 @@ Galileo到着後だけredactする案は、SDK queueと通信経路に生デー�
 
 - 状態：採用
 - 決定日：2026-07-24
-- 関連要件：REL-007からREL-012、OPS-004
+- 関連要件：DIR-001からDIR-003、COL-001からCOL-003、OPS-004
 
 ### 背景
 
@@ -504,11 +647,12 @@ direct SDKは構成が少なく、HermesとGalileoの専用連携に適してい
 | crash耐久 | process終了時flushで足りる | crash後の未送信span復元が必要 |
 | policy | process内redactionで足りる | 複数serviceへ共通policyを強制する |
 | self-observability | SDK接続状態、startup buffer、startup dropで足りる | partial rejection、downstream queue age、retry、最終送信成功を計測する |
-| OTLP応答 | 408と5xxの現行retryで足りる | 429、`Retry-After`、partial successを仕様どおり扱う |
+| OTLP応答 | 採用dependencyの408と5xx retry、429 no-retry、partial success非検出を許容する | 429、`Retry-After`、partial successを運用要件として扱う |
 | routing | 一つのGalileo送信先 | 複数tenantまたは複数destinationを中央管理する |
 
 Collector profileでは、applicationから標準OTLP exporterでlocal Collectorへ送り、CollectorがGalileoのOTLP endpointと認証headerを所有する。
 このprofileは公式GalileoSpanProcessorを経由しないため、導入前に別ADR、credential管理、Galileoとのwire contract testが必要になる。
+Direct adapterには、OTLP exporter wrapper、永続WAL、tail samplingを追加しない。
 
 ### 影響
 
@@ -521,21 +665,55 @@ Collector profileでは、applicationから標準OTLP exporterでlocal Collector
 
 全環境へ最初からCollectorを必須にする案は、小規模利用にも別processと設定管理を要求するため採用しない。
 startup bufferの観測だけでend-to-endの配送SLOまで充足したとみなす案は、接続後のSDK queueとGalileo受理を検証できないため採用しない。
+Direct adapterへdata-plane retryとpartial success解析を組み込む案は、公式SDKとの責務が重なり、Collector profileと異なる独自配送層を保守することになるため採用しない。
 
 Collectorの耐久性は、[OpenTelemetry Collector Resiliency](https://opentelemetry.io/docs/collector/resiliency/)を基準にする。
 
-## 設計上の未解決事項
+## ADR-004 Galileo native Session
 
-次の事項は実装済み動作ではなく、受入前の変更または検証対象である。
+- 状態：採用
+- 決定日：2026-07-24
+- 関連要件：SES-001からSES-006、TEL-002、PRI-006、TST-006、TST-012
+
+### 背景
+
+GalileoではSessionが複数traceをまとめる会話単位であり、Conversation QualityなどのmetricはSessionを評価対象にする。
+`gen_ai.conversation.id`だけでは、公式Session APIで作成したnative Sessionとの対応をadapterが保証できない。
+
+### 決定
+
+公式`GalileoLogger.start_session(external_id=...)`でnative Sessionを作成または再利用する。
+external ID、`gen_ai.conversation.id`、`hermes.session.id`には同じHermes session HMACを使い、返却UUIDを`galileo.session.id`として全関連spanへ設定する。
+解決は固定daemon worker、有界queue、single-flightで実行し、解決待ちspanも有界に保持する。
+Session APIがtimeoutまたは失敗した場合は、Session IDなしでtraceをfail-open exportする。
+`on_session_end`ではmappingを維持し、finalizeまたはresetでlocal mappingとpending処理を破棄する。
+
+### 影響
+
+- 複数のHermes turnを一つのGalileo native Sessionとして表示できる。
+- process再起動後も同じexternal IDで既存Sessionを再利用できる。
+- Session制御面とOTLP data planeの双方でprojectとlog streamを一致させる必要がある。
+- Session解決のqueue、timeout、failure、cleanupはhealthから観測できる。
+- Conversation Qualityを使うprofileでは、privacy審査済みtrace inputとoutputの明示Opt-Inが必要になる。
+- 複数processによる同時作成の一意性とGalileo上のmetric算出はlive E2Eへ依存する。
+
+### 棄却した案
+
+`gen_ai.conversation.id`だけで会話をgroupingする案は、native Sessionを必要とするSession metricの受入条件を満たさないため採用しない。
+raw Hermes session IDをexternal IDへ使う案は、相関IDから個人情報または内部識別子が漏れる可能性を残すため採用しない。
+hook callback内でSession APIを同期実行する案は、Galileo障害をHermesの応答latencyへ伝播させるため採用しない。
+
+根拠は、[Galileo Logger](https://docs.galileo.ai/sdk-api/logging/galileo-logger)、[Galileo Session](https://docs.galileo.ai/concepts/logging/sessions/using-sessions)、[Conversation Quality](https://docs.galileo.ai/concepts/metrics/agentic/conversation-quality)にある。
+
+## v1受入前の未解決事項
+
+次の事項はadapterが所有する変更または外部環境での検証対象である。
+Direct profileで実装しない配送機能は、未解決事項ではなくADR-003の責任分界として扱う。
 
 1. pseudonym secretのkey versionとrotation期間をまたぐ相関方針を追加する。
-2. tool argumentsとtool resultにも、必要なら切り詰め後の有効なJSON構造を保証する。
-3. Galileo processorのdownstream queue、最終送信成功、export latencyを観測する。
-4. HTTP 429と`Retry-After`の再試行、およびHTTP 200 partial successの検出を実装する。
-5. ready後のdelegate enqueue失敗をdrop metricへ反映する。
-6. `error.type`を許可語彙へ制限し、低cardinalityを実装で強制する。
-7. Hermesとstable API request IDおよびtool call IDの契約を固定する。
-8. native Galileo session provisioningの要否とlifecycleを決める。
-9. GenAI Semantic Conventionsのversion pinとmigration testを明示する。
-10. 実Galileoへの送信後read-backを外部環境で検証する。
-11. process強制終了時にも期限後daemon cleanupを完了させる必要がある環境では、外部spoolまたはCollectorを導入する。
+2. `error.type`を許可語彙へ制限し、低cardinalityを実装で強制する。
+3. Hermesとstable API request IDおよびtool call IDの契約を固定する。
+4. GenAI Semantic Conventionsのversion pinとmigration testを明示する。
+5. 実Galileoでnative Session再利用、複数turn、routing、privacy、Conversation Qualityをread-backする。
+6. 複数processが同じexternal IDを同時解決した場合に、重複native Sessionが生じないことを確認する。
+7. GitHub Actionsのsecret、variables、required checks、Conversation Quality metric設定を運用環境へ登録する。

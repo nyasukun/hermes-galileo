@@ -62,7 +62,7 @@ Galileo専用のproject、log stream、評価機能を使うため、公式Galil
 
 OpenTelemetryは、GenAI推論、Agent、tool実行、token利用量の属性規約を定義している。
 2026-07-24時点の[GenAI Semantic Conventionsリポジトリ](https://github.com/open-telemetry/semantic-conventions-genai)は、仕様のstatusをDevelopmentとしている。
-実装はSDKと規約のversionを固定し、version更新時に属性契約を再検証する必要がある。
+実装は採用時に解決されたSDKと規約のversionを記録し、version更新時に属性契約を再検証する必要がある。
 
 ### 論理操作としてのspan
 
@@ -147,17 +147,19 @@ Galileoは有効なspanのためにinputとoutputを要求する一方、OpenTel
 placeholderがGalileoの表示と評価で有効かどうかは、live E2Eで検証する。
 
 OTLP応答はHTTP 200でも一部のspanを拒否できる。
-`partialSuccess.rejectedSpans`を完全成功として扱わず、拒否数を観測する必要がある。
+`partialSuccess.rejectedSpans`を配送SLOへ含める場合は、response本文を解析できるCollector profileで拒否数を観測する必要がある。
 
 ### Session、trace、span
 
 [Galileo Logging Basics](https://docs.galileo.ai/sdk-api/logging/logging-basics)は、sessionを論理的な会話、traceを一回のユーザーinteraction、spanを個別のLLM、tool、workflow処理として説明している。
-現行実装はGalileo native sessionをprovisionせず、Hermes session IDを`gen_ai.conversation.id`へ設定して会話をgroupingする。
-一回のHermes turnを一つのtraceへ対応づける。
+[Galileo Sessions](https://docs.galileo.ai/concepts/logging/sessions/using-sessions)は、`GalileoLogger.start_session(external_id=...)`でSessionを作成または既存external IDから再利用できることを示している。
+現行実装はHermes session IDをHMAC-SHA-256で仮名化し、その値をGalileo native Sessionのexternal ID、`gen_ai.conversation.id`、`hermes.session.id`へ対応づける。
+公式SDKが返すSession UUIDを`galileo.session.id`として一回のHermes turnに属する全spanへ設定し、一回のturnを一つのtraceへ対応づける。
 
 一つの会話に複数のユーザーターンが含まれる場合、conversation IDを共有し、traceをターンごとに分ける。
 サブエージェントは親ターンのchild spanとし、その内部処理をさらに子として接続する。
-Galileo native sessionの作成、external ID設定、終了処理は将来拡張であり、現行の到達保証には含めない。
+`on_session_end`ではnative Session対応を維持し、明示的なfinalizeまたはresetでlocal mappingだけを解放する。
+remote Sessionは削除せず、同じexternal IDで会話が再開された場合は公式SDKの再利用動作へ委ねる。
 
 ### Agent運用品質とcost
 
@@ -220,9 +222,8 @@ spanをexportできない障害では、その障害を表すspanも同じ経路
 [OpenTelemetry SDK Metrics](https://opentelemetry.io/docs/specs/semconv/otel/sdk-metrics/)は、span processor queueのsize、capacity、処理数、queue-full error、exporterのin-flight数とexport数を定義している。
 [Collector Internal Telemetry](https://opentelemetry.io/docs/collector/internal-telemetry/)は、accepted、refused、enqueue failure、send failure、queue size、queue capacityなどの内部metricを提供する。
 
-hermes-galileoは、generated、accepted、exported、rejected、dropped、retry、queue oldest age、last successを低cardinality metricとして持つ必要がある。
-現行のdeferred processorは、SDK接続前のbuffer量、drop数、接続試行数、最終接続error typeを公開する。
-SDK接続後のqueue、export成否、partial rejection、queue oldest ageは公開しないため、必要ならprocessor wrapperまたはCollectorで取得する。
+hermes-galileoのDirect adapterは、自身が所有するspan生成、startup buffer、Session解決queue、pending span、drop、timeout、接続試行を低cardinalityなhealth値として公開する。
+SDK接続後のqueue、export成否、partial rejection、queue oldest ageはDirect adapterが所有しないため、配送SLOに必要ならCollector profileで取得する。
 
 ## 現行実装から確認できた状態
 
@@ -230,6 +231,9 @@ SDK接続後のqueue、export成否、partial rejection、queue oldest ageは公
 
 - Galileo公式span processorと、projectおよびlog streamの公式環境変数を使う。
 - installed `hermes_agent.plugins` entry pointから、`register`を持つ`hermes_galileo` module objectをloadできる。
+- hermes-otelと同じ配置の`config.yaml`から非secretな挙動設定を読み、環境変数、YAML、既定値の順で優先する。
+- credential、pseudonym secret、project、log stream、endpointを`config.yaml`では拒否し、Hermesの`.env`へ限定する。
+- Galileo SDKのroutingはprocess globalであるため、runtimeを初期化時のactive Hermes profileへbindingし、multiplexされた別profileのeventは誤配送を避けるためdropする。
 - 独立したTracerProviderへservice、version、environmentをresource属性として設定する。
 - `ParentBased`のratio samplerを使う。
 - hook例外をAgentへ伝播せず、payloadをlogへ出さない。
@@ -248,6 +252,12 @@ SDK接続後のqueue、export成否、partial rejection、queue oldest ageは公
 - canonicalなroot eventにproviderがない場合は、後続API eventのproviderをroot Agent spanへ補完する。
 - 開始eventが欠けてもsynthesized spanを作り、終了eventが欠けたspanをTTLまたはshutdownで閉じる。
 - 同時に保持するターン状態を512件に制限する。
+- `GalileoLogger.start_session`を二つのdaemon workerで実行し、同じHMAC external IDをsingle-flightで作成または再利用する。
+- Session解決queueとlocal mappingを各512件、解決中に終了したspanを4096件へ制限する。
+- 公式SDKが返したSession UUIDを検証し、同じHermes sessionの複数turnへ同じ`galileo.session.id`を設定する。
+- `on_session_end`後はmappingを維持し、finalizeまたはreset後はlocal mappingを解放する。
+- Session APIのtimeout、failure、capacity超過ではSession IDなしでspanをfail-open終了する。
+- subagentの親子session通知が逆転した場合は、未export spanをtop-level Sessionへ再束縛し、開始済みのobsoleteなSession要求結果をlocalで破棄する。
 - content取得を既定で無効にし、有効時もsecret redactionとcollection制限を適用する。
 - content取得設定にかかわらず、既知のhidden reasoning key、Anthropic reasoning block全体、Gemini `thought_signature`を`[REDACTED REASONING]`へ置換する。
 - base64 data URIを文字列全体と自由text途中の両方で省略する。
@@ -299,16 +309,17 @@ SDK接続後のqueue、export成否、partial rejection、queue oldest ageは公
 - 永続spool、tail sampling、Collector構成は実装していない。
 - API request ID、tool call ID、turn IDが欠けた場合はbest-effortの識別子を作るため、並行または反復呼び出しで一意性を保証できない。
 - TTL sweepはhook受信時に動くため、完全にidleなprocessでは次eventまたはshutdownまで回収されない。
-- 実Galileo環境でのread-back、native session、Agentic Metricsの算出は外部credentialを使うlive E2Eまで保証しない。
+- native Sessionのlocal SDK contractとwire送信は自動testで確認するが、実Galileo環境での保存、read-back、external IDのprocess間一意性、Conversation Quality算出はcredential付きlive E2Eの成功まで保証しない。
 
 これらは、[要件定義](./REQUIREMENTS.md)で受入基準と現在の充足状態へ対応づける。
 
 ## 調査から導いた設計判断
 
-調査結果から、三つの判断を設計へ固定する。
+調査結果から、四つの判断を設計へ固定する。
 
 1. Galileoへの既定送信には、公式`GalileoSpanProcessor`を使う。
-2. prompt、response、tool arguments、tool result、会話履歴は明示Opt-Inとし、許可された場合も送信前に秘匿する。
-3. 既定はdirect SDKとし、永続buffer、OTLP準拠retry、partial success検出、tail sampling、集中policy、詳細なexporter self-observabilityが必要な環境だけCollectorを追加する。
+2. Hermes sessionとGalileo native SessionをHMAC external IDで明示的に対応づけ、一つのSessionへ複数turn traceを格納する。
+3. prompt、response、tool arguments、tool result、会話履歴は明示Opt-Inとし、許可された場合も送信前に秘匿する。
+4. 既定はdirect SDKとし、永続buffer、OTLP準拠retry、partial success検出、tail sampling、集中policy、詳細なexporter self-observabilityが必要な環境だけCollectorを追加する。
 
 判断の理由、棄却案、影響は、[設計](./DESIGN.md)のADRに記載する。

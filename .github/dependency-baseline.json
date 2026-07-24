@@ -1,0 +1,51 @@
+{
+  "galileo": {
+    "package": "galileo",
+    "resolved": {
+      "annotated-types": "0.8.0",
+      "anyio": "4.14.2",
+      "attrs": "26.1.0",
+      "backoff": "2.2.1",
+      "certifi": "2026.7.22",
+      "charset-normalizer": "3.4.9",
+      "galileo": "2.5.1",
+      "galileo-core": "4.4.0",
+      "googleapis-common-protos": "1.75.0",
+      "grpcio": "1.83.0",
+      "h11": "0.16.0",
+      "httpcore": "1.0.9",
+      "httpx": "0.28.1",
+      "idna": "3.18",
+      "opentelemetry-api": "1.44.0",
+      "opentelemetry-exporter-otlp": "1.44.0",
+      "opentelemetry-exporter-otlp-proto-common": "1.44.0",
+      "opentelemetry-exporter-otlp-proto-grpc": "1.44.0",
+      "opentelemetry-exporter-otlp-proto-http": "1.44.0",
+      "opentelemetry-proto": "1.44.0",
+      "opentelemetry-sdk": "1.44.0",
+      "opentelemetry-semantic-conventions": "0.65b0",
+      "protobuf": "7.35.1",
+      "pydantic": "2.13.4",
+      "pydantic-core": "2.46.4",
+      "pydantic-partial": "0.11.1",
+      "pydantic-settings": "2.14.2",
+      "pyjwt": "2.13.0",
+      "python-dateutil": "2.9.0.post0",
+      "python-dotenv": "1.2.2",
+      "requests": "2.34.2",
+      "six": "1.17.0",
+      "tqdm": "4.69.0",
+      "typing-extensions": "4.16.0",
+      "typing-inspection": "0.4.2",
+      "urllib3": "2.7.0",
+      "uvloop": "0.22.1",
+      "wrapt": "1.17.3"
+    },
+    "version": "2.5.1"
+  },
+  "hermes_agent": {
+    "ref": "main",
+    "repository": "NousResearch/hermes-agent",
+    "sha": "a7a696ba59e0838a81351859abb39fb8484d4973"
+  }
+}

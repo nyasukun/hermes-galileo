@@ -1,0 +1,28 @@
+# Telemetry behavior only.
+# Keep Galileo credentials, routing, and the pseudonym secret in $HERMES_HOME/.env.
+
+enabled: true
+
+# Content capture is opt-in and still applies redaction and size limits.
+capture_content: false
+capture_conversation_history: false
+hash_user_ids: true
+max_content_chars: 12000
+max_collection_items: 100
+
+# Parent-based head sampling for complete per-turn traces.
+sample_rate: 1.0
+
+# Lifecycle and flush behavior.
+turn_ttl_seconds: 900
+async_flush_on_turn_end: true
+flush_timeout_millis: 10000
+
+# Local diagnostics and OpenTelemetry resource attributes.
+debug: false
+environment: development
+service_name: hermes-agent
+
+# Galileo native Session resolution.
+native_sessions_enabled: true
+native_session_timeout_millis: 5000

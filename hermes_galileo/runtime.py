@@ -14,11 +14,13 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .config import Settings
+from .config import Settings, active_hermes_home
+from .native_sessions import NativeSessionManager, NativeSessionResolution
 from .privacy import (
     anonymize_identifier,
     captured_value,
     messages_json,
+    pseudonymize_session_identifier,
     request_messages_json,
     response_messages_json,
 )
@@ -26,6 +28,7 @@ from .privacy import (
 logger = logging.getLogger("hermes_galileo")
 
 try:
+    from galileo import GalileoLogger
     from galileo.config import GalileoPythonConfig
     from galileo.constants import DEFAULT_API_URL, DEFAULT_CONSOLE_URL
     from galileo.otel import GalileoSpanProcessor, add_galileo_span_processor
@@ -42,6 +45,7 @@ except Exception as exc:  # pragma: no cover - exercised without optional depend
     DEFAULT_API_URL = ""  # type: ignore[assignment]
     DEFAULT_CONSOLE_URL = ""  # type: ignore[assignment]
     GalileoPythonConfig = None  # type: ignore[assignment,misc]
+    GalileoLogger = None  # type: ignore[assignment,misc]
     GalileoSpanProcessor = None  # type: ignore[assignment,misc]
     Context = None  # type: ignore[assignment,misc]
     Resource = None  # type: ignore[assignment,misc]
@@ -63,6 +67,52 @@ class RuntimeInitializationError(RuntimeError):
 
 class _PermanentGalileoConfigurationError(RuntimeError):
     """A process-global Galileo SDK configuration cannot be retried safely."""
+
+
+def _normalized_endpoint(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _validate_existing_sdk_configuration(
+    settings: Settings,
+    *,
+    reject_unpinned_custom_api: bool,
+) -> None:
+    """Reject a conflicting process-global SDK singleton without resetting it."""
+
+    existing = getattr(GalileoPythonConfig, "_instance", None)
+    if existing is None:
+        return
+    existing_key = getattr(existing, "api_key", None)
+    if hasattr(existing_key, "get_secret_value"):
+        existing_key = existing_key.get_secret_value()
+    if not existing_key or str(existing_key) != settings.api_key:
+        raise _PermanentGalileoConfigurationError(
+            "the existing Galileo SDK singleton cannot use the configured API key"
+        )
+    existing_console = _normalized_endpoint(getattr(existing, "console_url", ""))
+    expected_console = _normalized_endpoint(settings.console_url or DEFAULT_CONSOLE_URL)
+    if not existing_console or existing_console != expected_console:
+        raise _PermanentGalileoConfigurationError(
+            "the existing Galileo SDK singleton uses a different console URL"
+        )
+
+    existing_api = _normalized_endpoint(getattr(existing, "api_url", ""))
+    expected_api = _normalized_endpoint(
+        settings.api_url or (DEFAULT_API_URL if settings.console_url is None else "")
+    )
+    if expected_api:
+        if not existing_api or existing_api != expected_api:
+            raise _PermanentGalileoConfigurationError(
+                "the existing Galileo SDK singleton uses a different API URL"
+            )
+    elif reject_unpinned_custom_api:
+        # A pre-existing custom deployment can use a separate API host.
+        # Require an explicit pin so this plugin cannot silently inherit a
+        # route selected by unrelated Galileo instrumentation.
+        raise _PermanentGalileoConfigurationError(
+            "GALILEO_API_URL is required to validate a pre-existing custom Galileo SDK singleton"
+        )
 
 
 class _DeferredGalileoSpanProcessor:
@@ -135,55 +185,6 @@ class _DeferredGalileoSpanProcessor:
             logger.warning("Galileo span enqueue failed", exc_info=True)
 
     @staticmethod
-    def _normalized_endpoint(value: Any) -> str:
-        return str(value or "").strip().rstrip("/")
-
-    def _validate_existing_sdk_configuration(
-        self,
-        *,
-        reject_unpinned_custom_api: bool,
-    ) -> None:
-        """Reject a conflicting process-global SDK singleton without resetting it."""
-
-        existing = getattr(GalileoPythonConfig, "_instance", None)
-        if existing is None:
-            return
-        existing_key = getattr(existing, "api_key", None)
-        if hasattr(existing_key, "get_secret_value"):
-            existing_key = existing_key.get_secret_value()
-        if not existing_key or str(existing_key) != self._settings.api_key:
-            raise _PermanentGalileoConfigurationError(
-                "the existing Galileo SDK singleton cannot use the configured API key"
-            )
-        existing_console = self._normalized_endpoint(getattr(existing, "console_url", ""))
-        expected_console = self._normalized_endpoint(
-            self._settings.console_url or DEFAULT_CONSOLE_URL
-        )
-        if not existing_console or existing_console != expected_console:
-            raise _PermanentGalileoConfigurationError(
-                "the existing Galileo SDK singleton uses a different console URL"
-            )
-
-        existing_api = self._normalized_endpoint(getattr(existing, "api_url", ""))
-        expected_api = self._normalized_endpoint(
-            self._settings.api_url
-            or (DEFAULT_API_URL if self._settings.console_url is None else "")
-        )
-        if expected_api:
-            if not existing_api or existing_api != expected_api:
-                raise _PermanentGalileoConfigurationError(
-                    "the existing Galileo SDK singleton uses a different API URL"
-                )
-        elif reject_unpinned_custom_api:
-            # A pre-existing custom deployment can use a separate API host.
-            # Require an explicit pin so this plugin cannot silently inherit a
-            # route selected by unrelated Galileo instrumentation.
-            raise _PermanentGalileoConfigurationError(
-                "GALILEO_API_URL is required to validate a pre-existing custom "
-                "Galileo SDK singleton"
-            )
-
-    @staticmethod
     def _connection_status_code(exc: Exception) -> int | None:
         status_code = _integer(getattr(exc, "status_code", None))
         if status_code is None:
@@ -217,7 +218,8 @@ class _DeferredGalileoSpanProcessor:
             processor: Any | None = None
             try:
                 had_existing_config = getattr(GalileoPythonConfig, "_instance", None) is not None
-                self._validate_existing_sdk_configuration(
+                _validate_existing_sdk_configuration(
+                    self._settings,
                     reject_unpinned_custom_api=had_existing_config,
                 )
                 processor = GalileoSpanProcessor(
@@ -227,7 +229,8 @@ class _DeferredGalileoSpanProcessor:
                 )
                 # Close the validation-to-construction race. The exporter has
                 # now captured this singleton's API endpoint.
-                self._validate_existing_sdk_configuration(
+                _validate_existing_sdk_configuration(
+                    self._settings,
                     reject_unpinned_custom_api=False,
                 )
             except Exception as exc:
@@ -435,6 +438,8 @@ class _TurnState:
     turn_id: str
     task_id: str
     span: Any
+    native_session_key: str
+    native_session_generation: int
     started_monotonic: float
     last_updated_monotonic: float
     model: str = ""
@@ -460,10 +465,23 @@ class _ChildState:
 @dataclass(slots=True)
 class _DelegationState:
     child_session_id: str
+    parent_session_id: str
     parent_root_key: str
     span: Any
+    native_session_key: str
+    native_session_generation: int
     role: str
     started_monotonic: float
+
+
+@dataclass(slots=True)
+class _DeferredSpanEnd:
+    span: Any
+    native_session_key: str
+    native_session_generation: int
+    values: dict[str, Any] | None
+    error_type: str
+    error_message: str
 
 
 class _AsyncFlusher:
@@ -636,7 +654,7 @@ def _while_accepting_events(method: Any) -> Any:
     @wraps(method)
     def guarded(self: TelemetryRuntime, payload: dict[str, Any]) -> None:
         with self._lock:
-            if self._shutdown:
+            if self._shutdown or not self._accepts_active_profile_locked():
                 return
             method(self, payload)
 
@@ -647,6 +665,8 @@ class TelemetryRuntime:
     """Owns an isolated OTel provider and reconstructs concurrent Hermes turns."""
 
     _MAX_INFLIGHT_TURNS = 512
+    _MAX_SESSION_ALIASES = 512
+    _MAX_DEFERRED_SPAN_ENDS = 4_096
 
     def __init__(
         self,
@@ -655,6 +675,7 @@ class TelemetryRuntime:
         tracer_provider: Any | None = None,
         span_processor: Any | None = None,
         start_async_flusher: bool = True,
+        native_session_client_factory: Any | None = None,
     ) -> None:
         if not settings.enabled:
             raise RuntimeInitializationError("hermes-galileo is disabled")
@@ -677,6 +698,10 @@ class TelemetryRuntime:
         self._children: dict[str, _ChildState] = {}
         self._delegations: dict[str, _DelegationState] = {}
         self._session_metadata: dict[str, dict[str, Any]] = {}
+        self._session_aliases: dict[str, str] = {}
+        self._pending_session_releases: set[str] = set()
+        self._native_spans: dict[int, tuple[Any, str, int]] = {}
+        self._deferred_span_ends: dict[int, _DeferredSpanEnd] = {}
         self._shutdown = False
         self._provider_cleanup_deferred = False
         self._provider_cleanup_thread: threading.Thread | None = None
@@ -687,6 +712,9 @@ class TelemetryRuntime:
             "spans_finished": 0,
             "orphaned_spans": 0,
             "initialization_errors": 0,
+            "native_session_deferred_span_drops": 0,
+            "session_alias_capacity_rejections": 0,
+            "profile_scope_mismatches": 0,
         }
 
         self._owns_provider = tracer_provider is None
@@ -718,11 +746,51 @@ class TelemetryRuntime:
             "hermes-galileo",
             _package_version(),
         )
+        self._native_sessions: NativeSessionManager | None = None
+        if settings.native_sessions_enabled:
+
+            def validate_native_session_configuration() -> None:
+                _validate_existing_sdk_configuration(
+                    settings,
+                    reject_unpinned_custom_api=(
+                        getattr(GalileoPythonConfig, "_instance", None) is not None
+                    ),
+                )
+
+            if native_session_client_factory is None:
+
+                def native_session_client_factory() -> Any:
+                    return GalileoLogger(
+                        project=settings.project,
+                        log_stream=settings.log_stream,
+                    )
+
+            self._native_sessions = NativeSessionManager(
+                settings,
+                client_factory=native_session_client_factory,
+                on_resolved=self._on_native_session_resolved,
+                configuration_validator=validate_native_session_configuration,
+            )
         self._flusher = (
             _AsyncFlusher(self.force_flush)
             if start_async_flusher and settings.async_flush_on_turn_end
             else None
         )
+
+    def _accepts_active_profile_locked(self) -> bool:
+        """Fail closed when a multiplexed process switches Hermes profiles."""
+
+        expected = self.settings.hermes_home
+        if not expected:
+            return True
+        try:
+            current = str(active_hermes_home())
+        except Exception:
+            current = ""
+        if current == expected:
+            return True
+        self._stats["profile_scope_mismatches"] += 1
+        return False
 
     # ------------------------------------------------------------------
     # Span primitives and state lookup
@@ -735,7 +803,17 @@ class TelemetryRuntime:
         parent: Any | None,
         kind: Any,
         attributes: dict[str, Any],
+        native_session_key: str = "",
+        native_session_generation: int = 0,
     ) -> Any:
+        resolution = NativeSessionResolution("disabled")
+        if self._native_sessions is not None and native_session_key:
+            if native_session_generation:
+                current = self._native_sessions.lookup(native_session_key)
+                if current.generation == native_session_generation:
+                    resolution = current
+            else:
+                resolution = self._native_sessions.ensure(native_session_key)
         base_context = Context()
         context = (
             trace.set_span_in_context(parent, base_context) if parent is not None else base_context
@@ -746,6 +824,12 @@ class TelemetryRuntime:
             kind=kind,
             attributes=_attributes(attributes),
         )
+        if resolution.status in {"pending", "ready"}:
+            self._native_spans[id(span)] = (
+                span,
+                native_session_key,
+                resolution.generation,
+            )
         self._stats["spans_started"] += 1
         return span
 
@@ -764,6 +848,53 @@ class TelemetryRuntime:
         error_type: str = "",
         error_message: str = "",
     ) -> None:
+        span_identity = id(span)
+        if span_identity in self._deferred_span_ends:
+            return
+        native_span = self._native_spans.get(span_identity)
+        if native_span is not None and self._native_sessions is not None:
+            _, native_session_key, native_session_generation = native_span
+            resolution = self._native_sessions.lookup(native_session_key)
+            if (
+                resolution.generation == native_session_generation
+                and resolution.status == "pending"
+            ):
+                if len(self._deferred_span_ends) < self._MAX_DEFERRED_SPAN_ENDS:
+                    self._deferred_span_ends[span_identity] = _DeferredSpanEnd(
+                        span=span,
+                        native_session_key=native_session_key,
+                        native_session_generation=native_session_generation,
+                        values=dict(values) if values is not None else None,
+                        error_type=error_type,
+                        error_message=error_message,
+                    )
+                    return
+                self._stats["native_session_deferred_span_drops"] += 1
+            elif (
+                resolution.generation == native_session_generation and resolution.status == "ready"
+            ):
+                self._set_attributes(
+                    span,
+                    {"galileo.session.id": resolution.galileo_session_id},
+                )
+        self._complete_end_span(
+            span,
+            values=values,
+            error_type=error_type,
+            error_message=error_message,
+        )
+
+    def _complete_end_span(
+        self,
+        span: Any,
+        *,
+        values: dict[str, Any] | None = None,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> None:
+        span_identity = id(span)
+        self._native_spans.pop(span_identity, None)
+        self._deferred_span_ends.pop(span_identity, None)
         if values:
             self._set_attributes(span, values)
         try:
@@ -792,6 +923,326 @@ class TelemetryRuntime:
             self._stats["spans_finished"] += 1
         except Exception:
             logger.warning("Could not end Galileo span", exc_info=True)
+
+    def _on_native_session_resolved(
+        self,
+        native_session_key: str,
+        galileo_session_id: str | None,
+        generation: int,
+    ) -> None:
+        """Finalize one Session decision for all active work using its key."""
+
+        with self._lock:
+            if not galileo_session_id:
+                for span_identity, (_, key, bound_generation) in list(self._native_spans.items()):
+                    if key == native_session_key and bound_generation == generation:
+                        self._native_spans.pop(span_identity, None)
+                for state in self._turns.values():
+                    if (
+                        state.native_session_key == native_session_key
+                        and state.native_session_generation == generation
+                    ):
+                        # A failed/expired lookup is a permanent fail-open
+                        # decision for this turn. Do not re-provision midway
+                        # after the failed mapping is evicted or finalized.
+                        state.native_session_key = ""
+                        state.native_session_generation = 0
+                for delegation in self._delegations.values():
+                    if (
+                        delegation.native_session_key == native_session_key
+                        and delegation.native_session_generation == generation
+                    ):
+                        delegation.native_session_key = ""
+                        delegation.native_session_generation = 0
+            deferred = [
+                request
+                for request in self._deferred_span_ends.values()
+                if request.native_session_key == native_session_key
+                and request.native_session_generation == generation
+            ]
+            for request in deferred:
+                if galileo_session_id:
+                    self._set_attributes(
+                        request.span,
+                        {"galileo.session.id": galileo_session_id},
+                    )
+                self._complete_end_span(
+                    request.span,
+                    values=request.values,
+                    error_type=request.error_type,
+                    error_message=request.error_message,
+                )
+            if deferred and not self._shutdown and getattr(self, "_flusher", None) is not None:
+                self._flusher.request()
+
+    def _session_pseudonym(self, session_id: Any) -> str:
+        return pseudonymize_session_identifier(
+            session_id,
+            secret=self.settings.pseudonym_secret or self.settings.api_key,
+        )
+
+    def _top_level_session_locked(self, session_id: str) -> str:
+        current = session_id
+        seen: set[str] = set()
+        while current in self._session_aliases and current not in seen:
+            seen.add(current)
+            current = self._session_aliases[current]
+        return current
+
+    def _native_session_key_locked(self, session_id: str) -> str:
+        if not session_id:
+            return ""
+        return self._session_pseudonym(self._top_level_session_locked(session_id))
+
+    def _session_is_descendant_or_same_locked(
+        self,
+        session_id: str,
+        ancestor_session_id: str,
+    ) -> bool:
+        if not session_id or not ancestor_session_id:
+            return False
+        if session_id == ancestor_session_id:
+            return True
+
+        current = session_id
+        seen: set[str] = set()
+        while current not in seen:
+            seen.add(current)
+            delegation = self._delegations.get(current)
+            if delegation is None:
+                break
+            current = delegation.parent_session_id
+            if current == ancestor_session_id:
+                return True
+
+        return (
+            self._top_level_session_locked(ancestor_session_id) == ancestor_session_id
+            and self._top_level_session_locked(session_id) == ancestor_session_id
+        )
+
+    def _session_has_activity_locked(self, session_id: str) -> bool:
+        return any(
+            self._session_is_descendant_or_same_locked(state.session_id, session_id)
+            for state in self._turns.values()
+        ) or any(
+            self._session_is_descendant_or_same_locked(child_session_id, session_id)
+            for child_session_id in self._delegations
+        )
+
+    def _set_session_alias_locked(self, child_session_id: str, parent_session_id: str) -> bool:
+        if not child_session_id or not parent_session_id:
+            return False
+        top_level_parent = self._top_level_session_locked(parent_session_id)
+        if child_session_id == top_level_parent:
+            return False
+        if (
+            child_session_id not in self._session_aliases
+            and len(self._session_aliases) >= self._MAX_SESSION_ALIASES
+        ):
+            protected = (
+                set(self._active_by_session) | set(self._session_metadata) | set(self._delegations)
+            )
+            evictable = next(
+                (
+                    existing_child
+                    for existing_child in self._session_aliases
+                    if existing_child not in protected
+                ),
+                None,
+            )
+            if evictable is None:
+                self._stats["session_alias_capacity_rejections"] += 1
+                return False
+            self._session_aliases.pop(evictable, None)
+        self._session_aliases[child_session_id] = top_level_parent
+
+        parent_conversation_id = self._session_pseudonym(top_level_parent)
+        child_root_keys = {
+            state.key for state in self._turns.values() if state.session_id == child_session_id
+        }
+        affected_spans = {
+            id(self._turns[root_key].span): self._turns[root_key].span
+            for root_key in child_root_keys
+        }
+        affected_spans.update(
+            {
+                id(child.span): child.span
+                for child in self._children.values()
+                if child.root_key in child_root_keys
+            }
+        )
+        affected_spans.update(
+            {
+                id(delegation.span): delegation.span
+                for delegation in self._delegations.values()
+                if delegation.parent_root_key in child_root_keys
+            }
+        )
+        for span in affected_spans.values():
+            self._set_attributes(
+                span,
+                {
+                    "gen_ai.conversation.id": parent_conversation_id,
+                    "hermes.session.id": parent_conversation_id,
+                },
+            )
+
+        if self._native_sessions is not None:
+            child_key = self._session_pseudonym(child_session_id)
+            if child_key != parent_conversation_id:
+                parent_root_key = self._active_by_session.get(
+                    parent_session_id
+                ) or self._active_by_session.get(top_level_parent)
+                parent_state = self._turns.get(parent_root_key) if parent_root_key else None
+                parent_delegation = self._delegations.get(parent_session_id)
+                if parent_state is not None:
+                    parent_native_key = parent_state.native_session_key
+                    parent_native_generation = parent_state.native_session_generation
+                elif parent_delegation is not None:
+                    parent_native_key = parent_delegation.native_session_key
+                    parent_native_generation = parent_delegation.native_session_generation
+                else:
+                    parent_native_key = ""
+                    parent_native_generation = 0
+                resolution = self._rebind_native_session_locked(
+                    child_key,
+                    parent_native_key,
+                    parent_native_generation,
+                    conversation_id=parent_conversation_id,
+                )
+                effective_native_key = (
+                    parent_native_key if resolution.status in {"pending", "ready"} else ""
+                )
+                effective_native_generation = resolution.generation if effective_native_key else 0
+                for span_identity, span in affected_spans.items():
+                    if effective_native_key:
+                        self._native_spans[span_identity] = (
+                            span,
+                            effective_native_key,
+                            effective_native_generation,
+                        )
+                    else:
+                        self._native_spans.pop(span_identity, None)
+                for state in self._turns.values():
+                    if state.session_id == child_session_id:
+                        state.native_session_key = effective_native_key
+                        state.native_session_generation = effective_native_generation
+                for delegation in self._delegations.values():
+                    if delegation.parent_root_key in child_root_keys:
+                        delegation.native_session_key = effective_native_key
+                        delegation.native_session_generation = effective_native_generation
+                # If out-of-order hooks provisioned the child first, discard
+                # only that obsolete local mapping. An SDK call already in
+                # flight cannot be cancelled, but its late result is ignored
+                # and Galileo performs no remote deletion.
+                self._native_sessions.abandon(child_key)
+        return True
+
+    def _rebind_native_session_locked(
+        self,
+        old_native_session_key: str,
+        new_native_session_key: str,
+        new_native_session_generation: int,
+        *,
+        conversation_id: str,
+    ) -> NativeSessionResolution:
+        if self._native_sessions is None:
+            return NativeSessionResolution("disabled")
+        resolution = NativeSessionResolution("failed")
+        if new_native_session_key and new_native_session_generation:
+            current = self._native_sessions.lookup(new_native_session_key)
+            if current.generation == new_native_session_generation:
+                resolution = current
+        matching_spans = [
+            (span_identity, span)
+            for span_identity, (span, key, _generation) in self._native_spans.items()
+            if key == old_native_session_key
+        ]
+        for span_identity, span in matching_spans:
+            self._set_attributes(
+                span,
+                {
+                    "gen_ai.conversation.id": conversation_id,
+                    "hermes.session.id": conversation_id,
+                },
+            )
+            if resolution.status in {"pending", "ready"}:
+                self._native_spans[span_identity] = (
+                    span,
+                    new_native_session_key,
+                    resolution.generation,
+                )
+            else:
+                self._native_spans.pop(span_identity, None)
+
+        deferred = [
+            request
+            for request in self._deferred_span_ends.values()
+            if request.native_session_key == old_native_session_key
+        ]
+        if resolution.status == "pending":
+            for request in deferred:
+                request.native_session_key = new_native_session_key
+                request.native_session_generation = resolution.generation
+        elif resolution.status == "ready":
+            for request in deferred:
+                self._set_attributes(
+                    request.span,
+                    {"galileo.session.id": resolution.galileo_session_id},
+                )
+                self._complete_end_span(
+                    request.span,
+                    values=request.values,
+                    error_type=request.error_type,
+                    error_message=request.error_message,
+                )
+        else:
+            for request in deferred:
+                self._complete_end_span(
+                    request.span,
+                    values=request.values,
+                    error_type=request.error_type,
+                    error_message=request.error_message,
+                )
+        return resolution
+
+    def _release_session_mapping_locked(self, session_id: str) -> None:
+        if not session_id:
+            return
+        if self._session_has_activity_locked(session_id):
+            self._pending_session_releases.add(session_id)
+            return
+        if session_id in self._session_aliases:
+            self._session_aliases.pop(session_id, None)
+            self._pending_session_releases.discard(session_id)
+            self._drain_pending_session_releases_locked()
+            return
+        self._finalize_session_mapping_locked(session_id)
+
+    def _finalize_session_mapping_locked(self, session_id: str) -> None:
+        self._pending_session_releases.discard(session_id)
+        aliases = [
+            child
+            for child, parent in self._session_aliases.items()
+            if self._top_level_session_locked(parent) == session_id
+        ]
+        for child in aliases:
+            self._session_aliases.pop(child, None)
+            self._pending_session_releases.discard(child)
+        if self._native_sessions is not None:
+            self._native_sessions.finalize(self._session_pseudonym(session_id))
+
+    def _drain_pending_session_releases_locked(self) -> None:
+        for session_id in tuple(self._pending_session_releases):
+            if session_id not in self._pending_session_releases:
+                continue
+            if self._session_has_activity_locked(session_id):
+                continue
+            if session_id in self._session_aliases:
+                self._session_aliases.pop(session_id, None)
+                self._pending_session_releases.discard(session_id)
+                continue
+            self._finalize_session_mapping_locked(session_id)
 
     @staticmethod
     def _scope(payload: dict[str, Any]) -> tuple[str, str, str]:
@@ -848,6 +1299,8 @@ class TelemetryRuntime:
         scope, session_id, turn_id = self._scope(payload)
         task_id = _string(payload.get("task_id"), 500)
         key = f"{scope}:turn:{turn_id}" if turn_id else f"{scope}:active"
+        if session_id and self._top_level_session_locked(session_id) == session_id:
+            self._pending_session_releases.discard(session_id)
 
         existing = self._turns.get(key)
         if existing is not None:
@@ -891,19 +1344,29 @@ class TelemetryRuntime:
             enabled=self.settings.hash_user_ids,
             secret=self.settings.pseudonym_secret or self.settings.api_key,
         )
-        parent = self._delegations.get(session_id).span if session_id in self._delegations else None
+        session_pseudonym = self._native_session_key_locked(session_id)
+        delegation = self._delegations.get(session_id)
+        parent = delegation.span if delegation is not None else None
+        native_session_key = (
+            delegation.native_session_key
+            if delegation is not None
+            else self._native_session_key_locked(session_id)
+        )
+        expected_native_generation = (
+            delegation.native_session_generation if delegation is not None else 0
+        )
 
         attributes = {
             "gen_ai.operation.name": "invoke_agent",
             "gen_ai.provider.name": provider,
             "gen_ai.agent.name": agent_name,
             "gen_ai.request.model": model,
-            "gen_ai.conversation.id": session_id,
+            "gen_ai.conversation.id": session_pseudonym,
             "gen_ai.input.messages": messages_json("user", input_value, self.settings),
             "input.value": captured_input,
             "input.mime_type": "text/plain",
             "openinference.span.kind": "AGENT",
-            "hermes.session.id": session_id,
+            "hermes.session.id": session_pseudonym,
             "hermes.turn.id": turn_id,
             "hermes.task.id": task_id,
             "hermes.platform": payload.get("platform") or session_metadata.get("platform"),
@@ -916,7 +1379,14 @@ class TelemetryRuntime:
             parent=parent,
             kind=SpanKind.INTERNAL,
             attributes=attributes,
+            native_session_key=native_session_key,
+            native_session_generation=expected_native_generation,
         )
+        turn_native_session_key = ""
+        turn_native_session_generation = 0
+        native_binding = self._native_spans.get(id(span))
+        if native_binding is not None:
+            _, turn_native_session_key, turn_native_session_generation = native_binding
         now = time.monotonic()
         state = _TurnState(
             key=key,
@@ -924,6 +1394,8 @@ class TelemetryRuntime:
             turn_id=turn_id,
             task_id=task_id,
             span=span,
+            native_session_key=turn_native_session_key,
+            native_session_generation=turn_native_session_generation,
             started_monotonic=now,
             last_updated_monotonic=now,
             model=model,
@@ -1055,6 +1527,8 @@ class TelemetryRuntime:
             parent=parent_span if parent_span is not None else root.span,
             kind=kind,
             attributes=values,
+            native_session_key=root.native_session_key,
+            native_session_generation=root.native_session_generation,
         )
         child = _ChildState(
             key=key,
@@ -1138,11 +1612,15 @@ class TelemetryRuntime:
             self.sweep_expired_locked()
             session_id = _string(payload.get("session_id"), 500)
             if session_id:
+                if self._top_level_session_locked(session_id) == session_id:
+                    self._pending_session_releases.discard(session_id)
                 self._session_metadata[session_id] = {
                     "model": payload.get("model"),
                     "platform": payload.get("platform"),
                     "sender_id": payload.get("sender_id"),
                 }
+                if self._native_sessions is not None:
+                    self._native_sessions.ensure(self._native_session_key_locked(session_id))
 
     @_while_accepting_events
     def on_pre_llm_call(self, payload: dict[str, Any]) -> None:
@@ -1199,7 +1677,7 @@ class TelemetryRuntime:
                 "gen_ai.operation.name": "chat",
                 "gen_ai.provider.name": provider,
                 "gen_ai.request.model": model,
-                "gen_ai.conversation.id": payload.get("session_id"),
+                "gen_ai.conversation.id": self._native_session_key_locked(root.session_id),
                 "gen_ai.input.messages": input_messages,
                 "input.value": captured_request,
                 "input.mime_type": "text/plain",
@@ -1514,9 +1992,12 @@ class TelemetryRuntime:
             child_session_id = _string(payload.get("child_session_id"), 500)
             if not child_session_id:
                 return
+            parent_session_id = _string(payload.get("parent_session_id"), 500)
             parent_payload = dict(payload)
-            parent_payload["session_id"] = payload.get("parent_session_id")
+            parent_payload["session_id"] = parent_session_id
             parent = self._ensure_turn_locked(parent_payload)
+            if not self._set_session_alias_locked(child_session_id, parent_session_id):
+                return
             existing = self._delegations.pop(child_session_id, None)
             if existing:
                 self._end_span(
@@ -1526,6 +2007,7 @@ class TelemetryRuntime:
                 )
             role = _string(payload.get("child_role") or "subagent", 200)
             goal = payload.get("child_goal")
+            conversation_id = self._native_session_key_locked(parent.session_id)
             span = self._start_span(
                 f"invoke_agent {role}",
                 parent=parent.span,
@@ -1534,21 +2016,28 @@ class TelemetryRuntime:
                     "gen_ai.operation.name": "invoke_agent",
                     "gen_ai.provider.name": "hermes",
                     "gen_ai.agent.name": role,
+                    "gen_ai.conversation.id": conversation_id,
                     "gen_ai.input.messages": messages_json("user", goal, self.settings),
                     "input.value": captured_value(goal, self.settings),
                     "openinference.span.kind": "AGENT",
-                    "hermes.subagent.parent_session_id": payload.get("parent_session_id"),
-                    "hermes.subagent.child_session_id": child_session_id,
+                    "hermes.session.id": conversation_id,
+                    "hermes.subagent.parent_session_id": self._session_pseudonym(parent_session_id),
+                    "hermes.subagent.child_session_id": self._session_pseudonym(child_session_id),
                     "hermes.subagent.parent_turn_id": payload.get("parent_turn_id"),
                     "hermes.subagent.parent_id": payload.get("parent_subagent_id"),
                     "hermes.subagent.child_id": payload.get("child_subagent_id"),
                     "hermes.subagent.role": role,
                 },
+                native_session_key=parent.native_session_key,
+                native_session_generation=parent.native_session_generation,
             )
             self._delegations[child_session_id] = _DelegationState(
                 child_session_id=child_session_id,
+                parent_session_id=parent_session_id,
                 parent_root_key=parent.key,
                 span=span,
+                native_session_key=parent.native_session_key,
+                native_session_generation=parent.native_session_generation,
                 role=role,
                 started_monotonic=time.monotonic(),
             )
@@ -1559,22 +2048,28 @@ class TelemetryRuntime:
             self.sweep_expired_locked()
             child_session_id = _string(payload.get("child_session_id"), 500)
             delegation = self._delegations.pop(child_session_id, None)
-            if delegation is None:
-                return
-            status = _string(payload.get("child_status") or "completed", 100).lower()
-            failed = status in {"error", "failed", "failure", "cancelled", "timeout"}
-            summary = payload.get("child_summary")
-            self._end_span(
-                delegation.span,
-                values={
-                    "gen_ai.output.messages": messages_json("assistant", summary, self.settings),
-                    "output.value": captured_value(summary, self.settings),
-                    "hermes.subagent.status": status,
-                    "hermes.subagent.duration_ms": _float(payload.get("duration_ms")),
-                },
-                error_type=status if failed else "",
-                error_message=_string(summary, 1_000) if failed else "",
-            )
+            if delegation is not None:
+                status = _string(payload.get("child_status") or "completed", 100).lower()
+                failed = status in {"error", "failed", "failure", "cancelled", "timeout"}
+                summary = payload.get("child_summary")
+                self._end_span(
+                    delegation.span,
+                    values={
+                        "gen_ai.output.messages": messages_json(
+                            "assistant", summary, self.settings
+                        ),
+                        "output.value": captured_value(summary, self.settings),
+                        "hermes.subagent.status": status,
+                        "hermes.subagent.duration_ms": _float(payload.get("duration_ms")),
+                    },
+                    error_type=status if failed else "",
+                    error_message=_string(summary, 1_000) if failed else "",
+                )
+            # Hermes closes child profiles without a child session_finalize
+            # event. Once subagent_stop arrives, its session-start metadata is
+            # no longer an active-alias protection boundary.
+            self._session_metadata.pop(child_session_id, None)
+            self._drain_pending_session_releases_locked()
 
     @_while_accepting_events
     def on_session_end(self, payload: dict[str, Any]) -> None:
@@ -1619,6 +2114,7 @@ class TelemetryRuntime:
                     request_flush=True,
                 )
             self._session_metadata.pop(session_id, None)
+            self._release_session_mapping_locked(session_id)
 
     @_while_accepting_events
     def on_session_reset(self, payload: dict[str, Any]) -> None:
@@ -1636,6 +2132,7 @@ class TelemetryRuntime:
                     request_flush=True,
                 )
             self._session_metadata.pop(old_session_id, None)
+            self._release_session_mapping_locked(old_session_id)
 
     # ------------------------------------------------------------------
     # Cleanup, flushing, and diagnostics
@@ -1665,19 +2162,10 @@ class TelemetryRuntime:
             )
             self._stats["orphaned_spans"] += 1
 
-        dangling_delegations = [
-            delegation
-            for delegation in self._delegations.values()
-            if delegation.parent_root_key == key
-        ]
-        for delegation in dangling_delegations:
-            self._delegations.pop(delegation.child_session_id, None)
-            self._end_span(
-                delegation.span,
-                error_type="abandoned_subagent",
-                error_message="Parent turn ended before the subagent stop event",
-            )
-            self._stats["orphaned_spans"] += 1
+        # Hermes runs top-level delegations in the background and may end the
+        # parent turn while a child is still queued. Keep every delegation
+        # until the canonical subagent_stop boundary (or process shutdown) so
+        # a later child turn cannot split into another Galileo conversation.
 
         final_output = output if output is not None else state.output
         self._end_span(
@@ -1699,6 +2187,7 @@ class TelemetryRuntime:
         if state.session_id and self._active_by_session.get(state.session_id) == key:
             self._active_by_session.pop(state.session_id, None)
         self._stats["turns_finished"] += 1
+        self._drain_pending_session_releases_locked()
 
         if request_flush and self.settings.async_flush_on_turn_end:
             if self._flusher is not None:
@@ -1730,11 +2219,29 @@ class TelemetryRuntime:
 
     def force_flush(self) -> bool:
         timeout = self.settings.flush_timeout_millis
+        deadline = time.monotonic() + timeout / 1_000
         try:
+            if self._native_sessions is not None:
+                # Keep a small part of the caller's total deadline for the
+                # actual OTel exporter flush. SDK Session work gets the rest.
+                reserve_seconds = min(max(timeout / 10_000, 0.01), 0.1)
+                native_wait = min(
+                    self.settings.native_session_timeout_millis / 1_000,
+                    max(deadline - time.monotonic() - reserve_seconds, 0),
+                )
+                if not self._native_sessions.wait_until_idle(native_wait):
+                    self._native_sessions.cancel_pending()
+                    self._native_sessions.wait_until_idle(
+                        max(deadline - time.monotonic() - reserve_seconds, 0)
+                    )
+            remaining_millis = max(
+                int((deadline - time.monotonic()) * 1_000),
+                1,
+            )
             if self._processor is not None and hasattr(self._processor, "force_flush"):
-                result = self._processor.force_flush(timeout)
+                result = self._processor.force_flush(remaining_millis)
             elif hasattr(self._provider, "force_flush"):
-                result = self._provider.force_flush(timeout)
+                result = self._provider.force_flush(remaining_millis)
             else:
                 return True
             return True if result is None else bool(result)
@@ -1753,9 +2260,38 @@ class TelemetryRuntime:
                 "inflight_turns": len(self._turns),
                 "inflight_child_spans": len(self._children),
                 "inflight_subagents": len(self._delegations),
+                "session_aliases": len(self._session_aliases),
+                "pending_session_releases": len(self._pending_session_releases),
+                "native_session_deferred_spans": len(self._deferred_span_ends),
+                "native_sessions_enabled": self.settings.native_sessions_enabled,
+                "profile_scope_enforced": bool(self.settings.hermes_home),
                 "provider_cleanup_deferred": self._provider_cleanup_deferred,
                 **self._stats,
             }
+            if self._native_sessions is not None:
+                snapshot.update(self._native_sessions.health_snapshot())
+            else:
+                snapshot.update(
+                    {
+                        "native_session_state": "disabled",
+                        "native_session_pending": 0,
+                        "native_session_ready": 0,
+                        "native_session_failed": 0,
+                        "native_session_mappings": 0,
+                        "native_session_release_pending": 0,
+                        "native_session_queue_depth": 0,
+                        "native_session_callbacks_inflight": 0,
+                        "native_session_worker_calls_inflight": 0,
+                        "native_session_worker_cleanup_deferred": False,
+                        "native_session_attempts": 0,
+                        "native_session_resolved": 0,
+                        "native_session_failures": 0,
+                        "native_session_timeouts": 0,
+                        "native_session_capacity_rejections": 0,
+                        "native_session_mapping_evictions": 0,
+                        "native_session_cancelled": 0,
+                    }
+                )
             if hasattr(self._processor, "health_snapshot"):
                 snapshot.update(self._processor.health_snapshot())
             return snapshot
@@ -1780,6 +2316,13 @@ class TelemetryRuntime:
             if self._shutdown:
                 return
             self._shutdown = True
+        native_deadline = time.monotonic() + self.settings.native_session_timeout_millis / 1_000
+        if self._native_sessions is not None and not self._native_sessions.wait_until_idle(
+            max(native_deadline - time.monotonic(), 0)
+        ):
+            self._native_sessions.cancel_pending()
+            self._native_sessions.wait_until_idle(max(native_deadline - time.monotonic(), 0))
+        with self._lock:
             for key in list(self._turns):
                 self._finish_turn_locked(
                     key,
@@ -1789,6 +2332,24 @@ class TelemetryRuntime:
                     error_message="Hermes process stopped before the turn completed",
                     request_flush=False,
                 )
+            for child_session_id, delegation in list(self._delegations.items()):
+                self._delegations.pop(child_session_id, None)
+                self._end_span(
+                    delegation.span,
+                    error_type="shutdown",
+                    error_message="Hermes process stopped before the subagent completed",
+                )
+                self._stats["orphaned_spans"] += 1
+            self._drain_pending_session_releases_locked()
+            for request in list(self._deferred_span_ends.values()):
+                self._complete_end_span(
+                    request.span,
+                    values=request.values,
+                    error_type=request.error_type,
+                    error_message=request.error_message,
+                )
+        if self._native_sessions is not None:
+            self._native_sessions.shutdown(max(native_deadline - time.monotonic(), 0))
         flusher_stopped = True
         if self._flusher is not None:
             flusher_stopped = self._flusher.shutdown(self.settings.flush_timeout_millis / 1_000)

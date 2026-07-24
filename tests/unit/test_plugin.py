@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import hermes_galileo
+import hermes_galileo.config as config_module
 from hermes_galileo import hooks
 from hermes_galileo.config import ConfigurationError, Settings
 from hermes_galileo.runtime import RuntimeInitializationError
@@ -194,6 +195,18 @@ def test_initialize_is_fail_open_for_invalid_missing_and_disabled_settings(
 
     assert hermes_galileo.initialize(missing) is None
     assert hermes_galileo.initialize(disabled) is None
+
+
+def test_initialize_is_fail_open_for_malformed_default_yaml(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("enabled: [\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "_default_config_path", lambda: config_path)
+
+    assert hermes_galileo.initialize() is None
+    assert hooks.get_runtime() is None
 
 
 def test_shutdown_flush_health_and_all_hook_adapters() -> None:

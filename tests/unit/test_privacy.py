@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Sequence
 from dataclasses import replace
@@ -17,6 +18,7 @@ from hermes_galileo.privacy import (
     captured_value,
     clip_text,
     messages_json,
+    pseudonymize_session_identifier,
     request_messages_json,
     response_messages_json,
 )
@@ -369,6 +371,22 @@ def test_identifier_hash_uses_keyed_hmac_when_secret_is_available() -> None:
     assert first.startswith("hmac-sha256:")
     assert second.startswith("hmac-sha256:")
     assert first != second
+
+
+def test_session_pseudonym_is_full_keyed_hmac_and_never_raw() -> None:
+    raw = " private-hermes-session "
+    expected = hmac.new(
+        b"session-key",
+        b"private-hermes-session",
+        hashlib.sha256,
+    ).hexdigest()
+
+    pseudonym = pseudonymize_session_identifier(raw, secret="session-key")
+
+    assert pseudonym == f"hermes:{expected}"
+    assert "private-hermes-session" not in pseudonym
+    assert pseudonymize_session_identifier("", secret="session-key") == ""
+    assert pseudonymize_session_identifier(raw, secret="other-key") != pseudonym
 
 
 def test_binary_deep_and_object_values_are_normalized_safely() -> None:

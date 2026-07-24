@@ -300,3 +300,23 @@ def anonymize_identifier(value: Any, *, enabled: bool, secret: str = "") -> str:
         return f"hmac-sha256:{digest[:24]}"
     digest = hashlib.sha256(encoded).hexdigest()
     return f"sha256:{digest[:24]}"
+
+
+def pseudonymize_session_identifier(value: Any, *, secret: str) -> str:
+    """Return the irreversible external ID used for Hermes/Galileo sessions.
+
+    Session identifiers are never exported verbatim.  Unlike the optional,
+    shortened user-ID pseudonym above, this contract always uses a keyed,
+    full-length HMAC so Galileo's ``external_id`` remains both stable and
+    collision resistant.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    digest = hmac.new(
+        secret.encode("utf-8", errors="replace"),
+        text.encode("utf-8", errors="replace"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hermes:{digest}"
