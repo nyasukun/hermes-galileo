@@ -34,7 +34,7 @@
       "python-dotenv": "1.2.2",
       "requests": "2.34.2",
       "six": "1.17.0",
-      "tqdm": "4.69.0",
+      "tqdm": "4.69.1",
       "typing-extensions": "4.16.0",
       "typing-inspection": "0.4.2",
       "urllib3": "2.7.0",
@@ -46,6 +46,6 @@
   "hermes_agent": {
     "ref": "main",
     "repository": "NousResearch/hermes-agent",
-    "sha": "a7a696ba59e0838a81351859abb39fb8484d4973"
+    "sha": "7cd48733db464471cf7da9501c12748ed9b570dc"
   }
 }
