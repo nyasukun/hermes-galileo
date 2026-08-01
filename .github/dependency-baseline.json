@@ -8,8 +8,8 @@
       "backoff": "2.2.1",
       "certifi": "2026.7.22",
       "charset-normalizer": "3.4.9",
-      "galileo": "2.5.1",
-      "galileo-core": "4.4.0",
+      "galileo": "2.6.0",
+      "galileo-core": "4.5.0",
       "googleapis-common-protos": "1.75.0",
       "grpcio": "1.83.0",
       "h11": "0.16.0",
@@ -34,18 +34,18 @@
       "python-dotenv": "1.2.2",
       "requests": "2.34.2",
       "six": "1.17.0",
-      "tqdm": "4.69.1",
+      "tqdm": "4.70.0",
       "typing-extensions": "4.16.0",
       "typing-inspection": "0.4.2",
       "urllib3": "2.7.0",
       "uvloop": "0.22.1",
       "wrapt": "1.17.3"
     },
-    "version": "2.5.1"
+    "version": "2.6.0"
   },
   "hermes_agent": {
     "ref": "main",
     "repository": "NousResearch/hermes-agent",
-    "sha": "7cd48733db464471cf7da9501c12748ed9b570dc"
+    "sha": "f88ed6c71768cdc7ea3bfa8cf62d16654792fd2a"
   }
 }
