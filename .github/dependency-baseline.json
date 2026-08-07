@@ -10,7 +10,7 @@
       "charset-normalizer": "3.4.9",
       "galileo": "2.6.0",
       "galileo-core": "4.5.0",
-      "googleapis-common-protos": "1.75.0",
+      "googleapis-common-protos": "1.75.1",
       "grpcio": "1.83.0",
       "h11": "0.16.0",
       "httpcore": "1.0.9",
@@ -28,7 +28,7 @@
       "pydantic": "2.13.4",
       "pydantic-core": "2.46.4",
       "pydantic-partial": "0.11.1",
-      "pydantic-settings": "2.14.2",
+      "pydantic-settings": "2.15.0",
       "pyjwt": "2.13.0",
       "python-dateutil": "2.9.0.post0",
       "python-dotenv": "1.2.2",
@@ -46,6 +46,6 @@
   "hermes_agent": {
     "ref": "main",
     "repository": "NousResearch/hermes-agent",
-    "sha": "f88ed6c71768cdc7ea3bfa8cf62d16654792fd2a"
+    "sha": "b3aa561faffd64f05436e429a6415d175e534ec9"
   }
 }
